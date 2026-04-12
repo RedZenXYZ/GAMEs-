@@ -1,0 +1,215 @@
+---× [ VARIABLEs ] ×---
+local WS = game:GetService("Workspace")
+local PLRS = game:GetService("Players")
+local LOC = PLRS.LocalPlayer
+local CHAR = LOC.Character or LOC.CharacterAdded:Wait()
+
+local COLLECTABLE = {
+	WS:WaitForChild("dropped"),
+	WS:WaitForChild("harvest")
+}
+
+local NPCs = {
+	WS:WaitForChild("enemies"),
+	WS:WaitForChild("scps"),
+	WS:WaitForChild("animals")
+}
+
+local SCRAPS = WS:FindFirstChild("scrap") or WS
+
+
+
+---× [ FUNCTIONs ] ×---
+local function TP(obj)
+	if typeof(obj) == "CFrame" then
+		CHAR:FindFirstChild("HumanoidRootPart").CFrame = obj
+		return
+	end
+	CHAR:FindFirstChild("HumanoidRootPart").CFrame = obj.CFrame
+end
+
+local function KILL(cf)
+	local args = {
+		cf,
+		cf
+	}
+	game:GetService("ReplicatedStorage"):WaitForChild("remotes"):WaitForChild("shoot"):FireServer(unpack(args))
+end
+
+local function COLLECT(obj, prox)
+	local prompt = prox or obj:FindFirstChildOfClass("ProximityPrompt")
+	if not prompt then return end
+	TP(obj)
+	task.wait(0.4)
+	fireproximityprompt(prompt)
+end
+
+local function FISH()
+	game:GetService("ReplicatedStorage"):WaitForChild("remotes"):WaitForChild("cast"):FireServer(CHAR:FindFirstChild("HumanoidRootPart").Position)
+	for i = 1, 100 do
+		game:GetService("ReplicatedStorage"):WaitForChild("remotes"):WaitForChild("fish_point"):FireServer(true)
+	end
+end
+
+
+
+---× [ UI ] ×---
+loadstring(game:HttpGet("https://raw.githubusercontent.com/RedZenXYZ/RedHub/main/Red_GuiScript"))()
+RedGui()
+createPage("Player")
+addToggle("God Mode", function()
+	local humanoid = CHAR:FindFirstChildOfClass("Humanoid")
+	local healthPercent = (humanoid.Health / humanoid.MaxHealth) * 100
+	if healthPercent < 90 then
+		game:GetService("ReplicatedStorage"):WaitForChild("remotes"):WaitForChild("fall_damage"):FireServer(-humanoid.MaxHealth)
+	end
+end)
+
+createPage("Items")
+addToggle("Collect Aura", function()
+	for _,t in COLLECTABLE do
+		for _,obj in t:GetChildren() do
+			local main = obj:FindFirstChild("main") or obj:FindFirstChild("Handle") or nil
+			if main then
+				local dist = LOC:DistanceFromCharacter(main.Position)
+				local prox = main:FindFirstChildOfClass("ProximityPrompt")
+				
+				if prox and dist < 15 then
+					fireproximityprompt(prox)
+				end
+			end
+		end
+	end
+end)
+
+addToggle("Auto Fish", function()
+	task.spawn(FISH)
+end, 0.1)
+
+addToggle("Auto Scrap", function()
+	local IsTP2 = false
+	local root = CHAR:FindFirstChild("HumanoidRootPart")
+	local oldCF = root.CFrame
+	
+	local supply = game:GetService("Workspace"):FindFirstChild("supply_crate")
+	if supply then
+		IsTP2 = true
+		COLLECT(supply.hey)
+	end
+	for _,obj in SCRAPS:GetChildren() do
+		if not obj.Name == "scrap" then continue end
+		local main = obj:FindFirstChild("defaultMaterial10")
+		if main then
+			IsTP2 = true
+			COLLECT(main)
+		end
+	end
+	task.wait(0.5)
+	if IsTP2 then
+		IsTP2 = false
+		root.CFrame = oldCF
+	end
+end)
+
+local IGNORED = {}
+local TPC = false
+addToggleState("Teleport Collect", function(state)
+	TPC = state
+	local IsTP = false
+	local root = CHAR:FindFirstChild("HumanoidRootPart")
+	local oldCF = root.CFrame
+	
+	while TPC do
+		for _,obj in COLLECTABLE[2]:GetChildren() do
+			if not TPC then print("break") break end
+			if table.find(IGNORED, obj.Name) then print("checked") continue end
+			
+			print("Work")
+			local main = obj:FindFirstChild("main") or obj:FindFirstChild("Handle") or nil
+			if main then
+				print("Collecting")
+				IsTP = true
+				COLLECT(main)
+			end
+		end
+		task.wait(1)
+		print("TP Back")
+		if IsTP then
+			IsTP = false
+			root.CFrame = oldCF
+		end
+	end
+end)
+
+addSelected("Ignore")
+local t = {}
+for _,harvest in COLLECTABLE[2]:GetChildren() do
+	if table.find(t, harvest.Name) then continue end
+	table.insert(t, harvest.Name)
+	addInsertSelect(IGNORED, harvest.Name)
+end
+
+createPage("Gun")
+local KILLDist = 80
+addTextBox("80", function(distance)
+	KILLDist = tonumber(distance)
+end)
+
+addToggle("KILL Aura", function()
+	for _,t in NPCs do
+		for _,npc in t:GetChildren() do
+			local hum = npc:FindFirstChildOfClass("Humanoid")
+			local root = npc:FindFirstChild("HumanoidRootPart")
+			if not (root and hum) then continue end
+			if hum.Health > 0 then
+				if LOC:DistanceFromCharacter(root.Position) < KILLDist then
+					KILL(root.CFrame)
+				end
+			end
+		end
+	end
+end)
+
+createPage("Location")
+local SPAWN = game:GetService("Workspace"):FindFirstChild("SpawnLocation").CFrame or CHAR:WaitForChild("HumanoidRootPart").CFrame
+addButton("Spawn", function()
+	TP(SPAWN)
+end)
+
+addButton("Flesh Entertain", function()
+	TP(CFrame.new(-10057, 58, 1360))
+end)
+
+addButton("Scientist", function()
+	TP(CFrame.new(-10450, -88, 1428))
+end)
+addTextLabel("Interactable")
+local INTERACTS = WS:FindFirstChild("interact")
+if INTERACTS then
+	for _,interactable in INTERACTS:GetChildren() do
+		addButton(interactable.Name, function()
+			TP(interactable:FindFirstChildOfClass("Part"))
+		end)
+	end
+end
+
+
+
+---× [ SCRIPT ] ×---
+-----+ Remove FallDamage +-----
+local FALLDMG = game:GetService("ReplicatedStorage"):WaitForChild("remotes"):FindFirstChild("fall_damage")
+if FALLDMG then
+	local o; o = hookmetamethod(game, "__namecall", function(self, ...)
+		local method = getnamecallmethod()
+		if not checkcaller() and self == FALLDMG and method  == "FireServer" then
+			return o(self, 0)
+		end
+		return o(self, ...)
+	end)
+end
+
+-----+ Remove Colourblind +-----
+local vision = game:GetService("Lighting"):FindFirstChild("relenas_vision")
+if vision then
+	vision:Destroy()
+end
