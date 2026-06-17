@@ -109,7 +109,7 @@ local Dark = loadstring(game:HttpGet(
 local Lib = Dark.CreateLib()
 
 local KILLDist = 80
-local IGNORED  = {}
+local SELECTED_Harvests  = {}
 
 -- ── Player Tab ────────────────────────────────────────────────────────────────
 local PlayerTab = Lib:AddTab("Player")
@@ -208,7 +208,7 @@ ItemsTab:AddToggle("Teleport Collect", "TP to each harvest item and collect it",
 			local didTP = false
 			for _, obj in ipairs(COLLECTABLE[2]:GetChildren()) do
 				if not tpcActive then break end
-				if table.find(IGNORED, obj.Name) then continue end
+				if not table.find(SELECTED_Harvests, obj.Name) then continue end
 				local main = obj:FindFirstChild("main") or obj:FindFirstChild("Handle")
 				if main then
 					didTP = true
@@ -233,15 +233,50 @@ for _, harvest in ipairs(COLLECTABLE[2]:GetChildren()) do
 	end
 end
 
-local IgnoreDropdown = ItemsTab:AddDropdown("Ignore List", "Skip these items during Teleport Collect", harvestNames, "multiple", function(list)
-	IGNORED = list
+local SelectedDropdown = ItemsTab:AddDropdown("Select List", "collect these items during Teleport Collect", harvestNames, "multiple", function(list)
+	SELECTED_Harvests = list
 end)
 COLLECTABLE[2].ChildAdded:Connect(function(harvest)
 	if not seen[harvest.Name] then
 		seen[harvest.Name] = true
 		table.insert(harvestNames, harvest.Name)
-		IgnoreDropdown:UpdateOptions(harvestNames)
+		SelectedDropdown:UpdateOptions(harvestNames)
 	end
+end)
+
+ItemsTab:AddTextLabel("Items")
+
+ItemsTab:AddButton("Get Batteries", "Collect all batteries in the world", function()
+	local oldCF = GetCFrame()
+	for _, battery in ipairs(WS:GetDescendants()) do
+		if battery.Name == "battery" then
+			local main = battery:GetChildren()[1]
+			if main then
+				COLLECT(battery, main:FindFirstChildOfClass("ProximityPrompt"))
+			end
+		end
+	end
+	TP(oldCF)
+end)
+
+ItemsTab:AddButton("Get Glass Bottles", "Collect all Glasses in the world", function()
+	local oldCF = GetCFrame()
+	for _,obj in WS:GetDescendants() do
+		if obj:IsA("MeshPart") and obj.Name == "glass" then
+			COLLECT(obj)
+		end
+	end
+	TP(oldCF)
+end)
+
+ItemsTab:AddButton("Get DogTags", "Collect all dogtags in dropped folder", function()
+	local oldCF = GetCFrame()
+	for _, obj in ipairs(COLLECTABLE[1]:GetChildren()) do
+		if obj.Name == "Dog Tag" then
+			COLLECT(obj.Handle)
+		end
+	end
+	TP(oldCF)
 end)
 
 -- ── Gun Tab ───────────────────────────────────────────────────────────────────
@@ -297,46 +332,9 @@ LocationTab:AddButton("Spawn", "Teleport to spawn", function()
 	TP(spawnCF)
 end)
 
-LocationTab:AddButton("Scientist", nil, function()
-	TP(CFrame.new(-10450, -88, 1428))
-end)
-
-LocationTab:AddButton("Get Batteries", "Collect all batteries in the world", function()
-	local oldCF = GetCFrame()
-	for _, battery in ipairs(WS:GetDescendants()) do
-		if battery.Name == "battery" then
-			local main = battery:GetChildren()[1]
-			if main then
-				COLLECT(battery, main:FindFirstChildOfClass("ProximityPrompt"))
-			end
-		end
-	end
-	TP(oldCF)
-end)
-
-LocationTab:AddButton("Get Glass Bottles", "Collect all Glasses in the world", function()
-	local oldCF = GetCFrame()
-	for _,obj in WS:GetDescendants() do
-		if obj:IsA("MeshPart") and obj.Name == "glass" then
-			COLLECT(obj)
-		end
-	end
-	TP(oldCF)
-end)
-
-LocationTab:AddButton("Get DogTags", "Collect all dogtags in dropped folder", function()
-	local oldCF = GetCFrame()
-	for _, obj in ipairs(COLLECTABLE[1]:GetChildren()) do
-		if obj.Name == "Dog Tag" then
-			COLLECT(obj.Handle)
-		end
-	end
-	TP(oldCF)
-end)
-
 local ignore = {"note", "glass"}
 if INTERACTS then
-	LocationTab:AddTextLabel("Interactables")
+	LocationTab:AddTextLabel("Others")
 	for _, interactable in ipairs(INTERACTS:GetChildren()) do
 		if table.find(ignore, interactable.Name) then continue end -- skip the ignore objects
 		
