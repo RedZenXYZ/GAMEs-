@@ -23,8 +23,8 @@ for _,rarity in Rep_Meats:GetChildren() do
 	for _,meat in rarity:GetChildren() do
 		table.insert(Meats_Name, meat.Name)
 		Meats[meat.Name] = {
-			Name = meat.Name,
-			Price = meat:GetAttribute("BasePrice"),
+			Name = meat.Name or "Name not founded",
+			Price = meat:GetAttribute("BasePrice") or "1",
 			Frame = MeatsShop[rarity.Name .. "Page"][meat.Name]
 		}
 	end
@@ -34,7 +34,7 @@ for _,totem in Rep_Totems:GetChildren() do
 	table.insert(Totems_Name, totem.Name)
 	Totems[totem.Name] = {
 		Name = totem.Name,
-		Price = totem:GetAttribute("Price"),
+		Price = totem:GetAttribute("Price") or "1",
 		Frame = TotemsShop[totem.Name]
 	}
 end
