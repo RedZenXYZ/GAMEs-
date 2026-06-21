@@ -144,12 +144,14 @@ local BuyMeat_remote = Remotes:WaitForChild("BuyMeat")
 local BuyItem_remote = Remotes:WaitForChild("BuyShopItem")
 
 local function BuyItem(item)
+	if item == nil then return end
 	if HasEnoughMoney(item.Price) and IsStocked(item.Frame) then
 		BuyItem_remote:FireServer(item.Name, false)
 	end
 end
 
 local function BuyMeat(meat)
+	if meat == nil then return end
 	if HasEnoughMoney(meat.Price) and IsStocked(meat.Frame) then
 		BuyMeat_remote:FireServer(meat.Name, false)
 	end
