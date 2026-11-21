@@ -1,4 +1,3 @@
-print("Hello")
 --[[
     Terraria TD Remastered
     Lobby Auto Queue + Match (macro recorder shell) — built on DARK Lib
@@ -66,6 +65,54 @@ print("[TDR] DARK Lib loaded.")
 
 local Lib = Dark.CreateLib()
 print("[TDR] Lib window created.")
+
+-- ── Logger: buffers entries; the Log tab (built at the end) shows them live ─
+local MAX_LOG_LINES = 300
+local LogEntries = {}
+local LogSink = nil              -- set by the Log tab once it exists
+local LogGameRemotes = true      -- Log tab toggle: show remotes the game/player fires
+
+local function Log(level, text)
+    local entry = {level = level, text = text, time = os.date("%H:%M:%S")}
+    table.insert(LogEntries, entry)
+    if #LogEntries > MAX_LOG_LINES then table.remove(LogEntries, 1) end
+    print(string.format("[TDR][%s] %s", level, text))
+    if LogSink then pcall(LogSink, entry) end
+end
+
+-- Same as GetFullName() but built from .Parent only, so it's safe inside a __namecall hook
+local function PathOf(inst)
+    local parts = {}
+    local cur = inst
+    while cur and cur ~= game do
+        table.insert(parts, 1, cur.Name)
+        cur = cur.Parent
+    end
+    return table.concat(parts, ".")
+end
+
+local function Describe(v)
+    local t = typeof(v)
+    if t == "CFrame" then
+        local p = v.Position
+        return string.format("CFrame(%.1f, %.1f, %.1f)", p.X, p.Y, p.Z)
+    elseif t == "Vector3" then
+        return string.format("Vector3(%.1f, %.1f, %.1f)", v.X, v.Y, v.Z)
+    elseif t == "Instance" then
+        return "Instance<" .. PathOf(v) .. ">"
+    elseif t == "string" then
+        return '"' .. v .. '"'
+    elseif t == "table" then
+        return "{table}"
+    end
+    return tostring(v)
+end
+
+local function DescribeArgs(args, n)
+    local out = {}
+    for i = 1, (n or #args) do out[i] = Describe(args[i]) end
+    return table.concat(out, ", ")
+end
 
 -- ── Config (save/load so Auto Queue survives auto-execute reloads) ─────
 local SAVE_DIR  = "TerrariaTDRemastered"
@@ -176,14 +223,20 @@ if IsInLobby() then
     -- ── Queue logic ────────────────────────────────────────────────────
     local function DoQueue()
         local UI = ReplicatedStorage:WaitForChild("Events"):WaitForChild("UI")
+        Log("send", string.format(">> CreateQueue(%s, %s, %s, 1, \"\")",
+            tostring(Config.Map), tostring(Config.Act), tostring(Config.Mode)))
         local ok, err = pcall(function()
-            UI.CreateQueue:InvokeServer(Config.Map, Config.Act, Config.Mode, 1, "")
+            local r1 = UI.CreateQueue:InvokeServer(Config.Map, Config.Act, Config.Mode, 1, "")
+            Log("ok", "<< CreateQueue returned: " .. Describe(r1))
             task.wait(0.5) -- let the queue register server-side before starting it
-            UI.StartQueue:InvokeServer()
+            Log("send", ">> StartQueue()")
+            local r2 = UI.StartQueue:InvokeServer()
+            Log("ok", "<< StartQueue returned: " .. Describe(r2))
         end)
         if ok then
             UpdateStatus()
         else
+            Log("error", "Queue failed: " .. tostring(err))
             Status:SetText("Queue failed — " .. tostring(err))
         end
         return ok
@@ -257,7 +310,83 @@ if IsInMatch() then
     local Macros = {}
     local SelectedMacro, SelectedRow = nil, nil
     local RemotesByLabel = {}
-    local PlayMacro, AddMacroListEntry, SaveMacros, LoadMacros
+    local TargetRemotes = {}          -- [remote instance] = label (filled by the remote scan)
+    local Playing = false             -- true while a macro is running (blocks overlapping runs)
+    local HookInstalled = false
+    local SelfCalls = 0               -- lets the remote spy skip calls this script makes itself
+    local PlayMacro, RunMacro, AddMacroListEntry, SaveMacros, LoadMacros
+
+    -- Fires a remote using the right method for its class (never trusts a stored
+    -- method name), returns pcall's (ok, result). Packs varargs HERE, not in the
+    -- closure, since a nested function can't use ... directly.
+    local function CallRemote(remote, ...)
+        local args = table.pack(...)
+        if HookInstalled and TargetRemotes[remote] then
+            SelfCalls = SelfCalls + 1 -- the hook consumes this synchronously
+        end
+        local ok, res = pcall(function()
+            if remote:IsA("RemoteFunction") then
+                return remote:InvokeServer(table.unpack(args, 1, args.n))
+            else
+                return remote:FireServer(table.unpack(args, 1, args.n))
+            end
+        end)
+        SelfCalls = 0 -- anything unconsumed means the call never reached the hook
+        return ok, res
+    end
+
+    -- ── Mana: PlayerGui.Main.Mana.Value (NumberValue) ─────────────────────
+    local function GetManaValue()
+        local gui  = LocalPlayer:FindFirstChild("PlayerGui")
+        local main = gui and gui:FindFirstChild("Main")
+        local mana = main and main:FindFirstChild("Mana")
+        return mana and mana:FindFirstChild("Value")
+    end
+
+    -- Blocks until mana >= cost (60s cap). Never blocks if the value isn't found.
+    local function WaitForMana(cost, tag)
+        local v = GetManaValue()
+        if not v then
+            Log("warn", "Mana value not found (PlayerGui.Main.Mana.Value), not waiting")
+            return true
+        end
+        if v.Value >= cost then return true end
+
+        local t0 = tick()
+        Log("info", string.format("%s waiting for mana: %.0f/%.0f", tag, v.Value, cost))
+        while v.Value < cost and tick() - t0 < 60 do task.wait(0.1) end
+        if v.Value >= cost then
+            Log("ok", string.format("%s mana ready after %.1fs (%.0f)", tag, tick() - t0, v.Value))
+            return true
+        end
+        Log("warn", string.format("%s mana wait timed out (%.0f/%.0f), firing anyway", tag, v.Value, cost))
+        return false
+    end
+
+    -- While recording: after an action is captured, the first drop in mana
+    -- (within 1.5s) is that action's cost. A newer action cancels the older watch.
+    local CostWatcher = nil
+    local function WatchManaCost(action)
+        if CostWatcher then CostWatcher:Disconnect(); CostWatcher = nil end
+        local v = GetManaValue()
+        if not v then return end
+
+        local before = v.Value
+        local conn
+        conn = v.Changed:Connect(function(new)
+            if new < before then
+                action.mana = math.ceil((before - new) - 1e-6)
+                Log("info", string.format("REC %s costs %d mana", action.remote, action.mana))
+                conn:Disconnect()
+                if CostWatcher == conn then CostWatcher = nil end
+            end
+        end)
+        CostWatcher = conn
+        task.delay(1.5, function()
+            if conn.Connected then conn:Disconnect() end
+            if CostWatcher == conn then CostWatcher = nil end
+        end)
+    end
 
     -- ── Left-top box: recorded macros list ──────────────────────────────
     local MacroBox = Instance.new("Frame", Root)
@@ -456,14 +585,18 @@ if IsInMatch() then
     -- ── Shared remote-fire helper (used by Auto-Replay) ─────────────────────
     local function FireRemoteByLabel(label, ...)
         local remote = RemotesByLabel[label]
-        if not remote then return false end
-        return (pcall(function()
-            if remote:IsA("RemoteFunction") then
-                remote:InvokeServer(...)
-            else
-                remote:FireServer(...)
-            end
-        end))
+        if not remote then
+            Log("error", "Remote not found: " .. label)
+            return false
+        end
+        Log("send", ">> " .. label .. "(" .. DescribeArgs(table.pack(...)) .. ")")
+        local ok, res = CallRemote(remote, ...)
+        if ok then
+            Log("ok", "<< " .. label .. " returned: " .. Describe(res))
+        else
+            Log("error", "<< " .. label .. " error: " .. tostring(res))
+        end
+        return ok
     end
 
     -- ── Auto-Replay: wait for the Rewards menu to be visible, then wait 3s
@@ -491,6 +624,7 @@ if IsInMatch() then
                         end
                     end
                     if MatchConfig.AutoReplay and rewards.Visible then
+                        Log("info", "Auto-Replay: Rewards visible, replaying in 3s")
                         task.wait(3)
                         if MatchConfig.AutoReplay then
                             FireRemoteByLabel("General.ReplayMatch")
@@ -515,13 +649,33 @@ if IsInMatch() then
         if AutoPlayRunning then return end
         AutoPlayRunning = true
         task.spawn(function()
+            local warnedNoSelection = false
             while MatchConfig.AutoPlayMacro do
-                if SelectedMacro then
-                    local lastAction = SelectedMacro.Actions[#SelectedMacro.Actions]
-                    local duration = lastAction and lastAction.t or 0
-                    PlayMacro(SelectedMacro)
-                    task.wait(duration + 1)
+                local rewards = GetRewardsFrame()
+                -- never start while the results screen is up; wait for the next match
+                while MatchConfig.AutoPlayMacro and rewards and rewards.Visible do
+                    task.wait(0.5)
+                end
+                if not MatchConfig.AutoPlayMacro then break end
+
+                if SelectedMacro and not Playing then
+                    warnedNoSelection = false
+                    Log("info", "Auto-Play: starting '" .. SelectedMacro.Name .. "'")
+                    RunMacro(SelectedMacro)
+                    -- play once per match: wait for this match to end (Rewards shows),
+                    -- the loop top then waits for it to hide again (next match)
+                    if rewards then
+                        while MatchConfig.AutoPlayMacro and not rewards.Visible do
+                            task.wait(0.5)
+                        end
+                    else
+                        task.wait(5)
+                    end
                 else
+                    if not SelectedMacro and not warnedNoSelection then
+                        warnedNoSelection = true
+                        Log("warn", "Auto-Play: no macro selected (use Select on a macro)")
+                    end
                     task.wait(1)
                 end
             end
@@ -532,18 +686,21 @@ if IsInMatch() then
     MakeCustomToggle(TogglesHolder, "Auto-Replay", MatchConfig.AutoReplay, function(state)
         MatchConfig.AutoReplay = state
         SaveMatchConfig()
+        Log("info", "Auto-Replay " .. (state and "ON" or "OFF"))
         if state then StartAutoReplay() end
     end)
 
     MakeCustomToggle(TogglesHolder, "Auto-Collect Items", MatchConfig.AutoCollectItems, function(state)
         MatchConfig.AutoCollectItems = state
         SaveMatchConfig()
+        Log("info", "Auto-Collect Items " .. (state and "ON" or "OFF"))
         if state then StartAutoCollect() else StopAutoCollect() end
     end)
 
     MakeCustomToggle(TogglesHolder, "Auto-Play Macro", MatchConfig.AutoPlayMacro, function(state)
         MatchConfig.AutoPlayMacro = state
         SaveMatchConfig()
+        Log("info", "Auto-Play Macro " .. (state and "ON" or "OFF"))
         if state then StartAutoPlayMacro() end
     end)
 
@@ -580,7 +737,7 @@ if IsInMatch() then
                 for k, v in ipairs(action.args) do
                     args[k] = SerializeValue(v)
                 end
-                actions[j] = {t = action.t, remote = action.remote, method = action.method, args = args}
+                actions[j] = {t = action.t, remote = action.remote, method = action.method, mana = action.mana, args = args}
             end
             out[i] = {Name = macro.Name, Actions = actions}
         end
@@ -596,7 +753,7 @@ if IsInMatch() then
                 for k, v in ipairs(action.args) do
                     args[k] = DeserializeValue(v)
                 end
-                actions[j] = {t = action.t, remote = action.remote, method = action.method, args = args}
+                actions[j] = {t = action.t, remote = action.remote, method = action.method, mana = action.mana, args = args}
             end
             out[i] = {Name = macro.Name, Actions = actions}
         end
@@ -604,11 +761,15 @@ if IsInMatch() then
     end
 
     SaveMacros = function()
-        pcall(function()
+        local ok, err = pcall(function()
             if isfolder and not isfolder(SAVE_DIR) then makefolder(SAVE_DIR) end
             writefile(MACRO_FILE, jsonencode(SerializeMacros(Macros)))
-            print("Macros have been saved.")
         end)
+        if ok then
+            Log("ok", "Macros saved (" .. #Macros .. ")")
+        else
+            Log("error", "Saving macros failed: " .. tostring(err))
+        end
     end
 
     -- ── Macro list rows: name, Select (marks it for Auto-Play), Play ─────
@@ -761,24 +922,100 @@ if IsInMatch() then
     end
 
     -- ── Playback: replays each recorded remote call at its recorded offset ─
-    PlayMacro = function(macro)
-        task.spawn(function()
-            local startedAt = tick()
-            for _, action in ipairs(macro.Actions) do
-                local remaining = action.t - (tick() - startedAt)
-                if remaining > 0 then task.wait(remaining) end
-                local remote = RemotesByLabel[action.remote]
-                if remote then
-                    pcall(function()
-                        if action.method == "InvokeServer" then
-                            remote:InvokeServer(table.unpack(action.args))
-                        else
-                            remote:FireServer(table.unpack(action.args))
-                        end
-                    end)
+    -- Every call runs in its own thread so one InvokeServer the server never
+    -- answers can't stall the rest of the timeline, and every send / return /
+    -- error / missing remote goes to the Log tab. Only one macro runs at a time.
+    RunMacro = function(macro)
+        if Playing then
+            Log("warn", "Already playing a macro, ignoring '" .. macro.Name .. "'")
+            return false
+        end
+        Playing = true
+
+        local total = #macro.Actions
+        local okCount, failCount, missing, pending = 0, 0, 0, 0
+
+        local ran, err = pcall(function()
+            Log("info", string.format("PLAY '%s' (%d actions)", macro.Name, total))
+
+            -- place/upgrade actions recorded before mana support have no cost to wait for
+            local unknownCost = 0
+            for _, a in ipairs(macro.Actions) do
+                if (a.remote == "Battle.PlaceTower" or a.remote == "UI.UpgradeTower") and not a.mana then
+                    unknownCost = unknownCost + 1
                 end
             end
+            if unknownCost > 0 then
+                Log("warn", unknownCost .. " place/upgrade action(s) have no recorded mana cost; re-record to enable mana waiting")
+            end
+
+            local startedAt = tick()
+            local lag = 0 -- how far the timeline has slipped (mana waits, slow answers)
+            for i, action in ipairs(macro.Actions) do
+                local target = action.t + lag
+                local remaining = target - (tick() - startedAt)
+                if remaining > 0 then task.wait(remaining) end
+
+                local remote = RemotesByLabel[action.remote]
+                local tag = string.format("#%d/%d %s", i, total, action.remote)
+                if not remote then
+                    missing = missing + 1
+                    Log("error", tag .. " - remote not found, skipped")
+                else
+                    if action.mana and action.mana > 0 then
+                        WaitForMana(action.mana, tag)
+                    end
+
+                    Log("send", string.format(">> %s(%s) @%.1fs", tag, DescribeArgs(action.args), action.t))
+                    pending = pending + 1
+                    local done = false
+                    task.spawn(function()
+                        local t0 = tick()
+                        local ok, res = CallRemote(remote, table.unpack(action.args))
+                        local dt = tick() - t0
+                        if not ok then
+                            failCount = failCount + 1
+                            Log("error", string.format("<< %s error: %s (%.2fs)", tag, tostring(res), dt))
+                        elseif res == false then
+                            failCount = failCount + 1
+                            Log("warn", string.format("<< %s returned false, server rejected it? (%.2fs)", tag, dt))
+                        else
+                            okCount = okCount + 1
+                            Log("ok", string.format("<< %s returned %s (%.2fs)", tag, Describe(res), dt))
+                        end
+                        pending = pending - 1
+                        done = true
+                    end)
+
+                    -- RemoteFunction: wait for the server's answer (5s cap) so the next
+                    -- action (targeting / upgrade / sell) runs after this one landed
+                    if remote:IsA("RemoteFunction") then
+                        local deadline = tick() + 5
+                        while not done and tick() < deadline do task.wait(0.05) end
+                    end
+                end
+
+                local late = (tick() - startedAt) - target
+                if late > 0.25 then lag = lag + late end
+            end
+
+            -- let in-flight calls report back before summarizing
+            local deadline = tick() + 10
+            while pending > 0 and tick() < deadline do task.wait(0.1) end
+            if pending > 0 then
+                Log("warn", pending .. " call(s) never returned (server not answering?)")
+            end
         end)
+
+        Playing = false
+        if not ran then Log("error", "Playback crashed: " .. tostring(err)) end
+        Log("info", string.format("DONE '%s': %d ok, %d failed/rejected, %d missing remote",
+            macro.Name, okCount, failCount, missing))
+        return ran
+    end
+
+    PlayMacro = function(macro)
+        task.spawn(RunMacro, macro)
     end
 
     LoadMacros()
@@ -800,11 +1037,27 @@ if IsInMatch() then
             }
             RecordButton.Text = "Stop"
             RecordButton.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+            Log("info", "REC start '" .. CurrentMacro.Name .. "'")
+            if not HookInstalled then
+                Log("error", "Remote hook is not installed, nothing will be captured")
+            end
         else
             Recording = false
             RecordButton.Text = "Record"
             RecordButton.BackgroundColor3 = Color3.fromRGB(60, 150, 90)
             if CurrentMacro then
+                local count = #CurrentMacro.Actions
+                Log(count > 0 and "info" or "warn",
+                    string.format("REC stop '%s': %d actions", CurrentMacro.Name, count))
+                local hasInstance = false
+                for _, a in ipairs(CurrentMacro.Actions) do
+                    for _, v in ipairs(a.args) do
+                        if typeof(v) == "Instance" then hasInstance = true end
+                    end
+                end
+                if hasInstance then
+                    Log("warn", "Macro has Instance arguments; they can't be saved to disk (this session only)")
+                end
                 table.insert(Macros, CurrentMacro)
                 AddMacroListEntry(CurrentMacro)
                 SaveMacros()
@@ -816,20 +1069,22 @@ if IsInMatch() then
 
     local function RecordAction(label, method, ...)
         if not CurrentMacro then return end
-        table.insert(CurrentMacro.Actions, {
+        local action = {
             t = tick() - RecordStart,
             remote = label,
             method = method,
             args = {...},
-        })
+        }
+        table.insert(CurrentMacro.Actions, action)
+        task.defer(WatchManaCost, action) -- measures what this call cost in mana
     end
 
     -- Every RemoteEvent/RemoteFunction under Events gets tracked dynamically
     -- (PlaceTower, TowerTargeting, UpgradeTower, SellTower, Skip, StartMatch,
     -- ReplayMatch, and anything else that shows up), instead of a fixed list.
     -- Runs in its own thread so a slow/missing remote can never block the UI.
-    local TargetRemotes = {}
     local IGNORED_REMOTES = {PickupDrop = true}
+    local scanned = false
 
     local function RegisterRemote(inst)
         local isRemote = inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction")
@@ -837,6 +1092,79 @@ if IsInMatch() then
             local label = inst:GetFullName():match("Events%.(.+)") or inst.Name
             TargetRemotes[inst] = label
             RemotesByLabel[label] = inst
+            if scanned then Log("info", "Remote added: " .. label) end
+        end
+    end
+
+    -- Called from the __namecall hook for every client->server call on a tracked
+    -- remote that this script did not make itself.
+    local function OnGameRemote(label, method, ...)
+        local recording = Recording
+        if recording then RecordAction(label, method, ...) end
+        if recording or LogGameRemotes then
+            local args = table.pack(...)
+            task.defer(function()
+                Log("send", string.format("%s %s (%s) %s",
+                    recording and "REC" or "GAME", label, method, DescribeArgs(args)))
+            end)
+        end
+    end
+
+    local LastKey, LastTime = nil, 0
+
+    -- A remote we haven't tracked (outside Events, created late, or replaced by
+    -- the game) is picked up the first time it fires while recording.
+    local function TrackUnknownRemote(remote)
+        if typeof(remote) ~= "Instance" or IGNORED_REMOTES[remote.Name] then return nil end
+        local path = PathOf(remote)
+        if not path:find("^ReplicatedStorage") or path:find("DefaultChatSystemChatEvents", 1, true) then
+            return nil
+        end
+        local label = path:match("Events%.(.+)") or path
+        TargetRemotes[remote] = label
+        RemotesByLabel[label] = remote
+        task.defer(Log, "info", "Auto-tracking remote first seen while recording: " .. label)
+        return label
+    end
+
+    -- Every client->server call lands here, from both hook layers
+    local function HandleRemoteCall(self, method, ...)
+        if SelfCalls == 0 and not Recording and not LogGameRemotes then return end
+
+        local label = TargetRemotes[self]
+        if not label then
+            if not Recording then return end
+            label = TrackUnknownRemote(self)
+            if not label then return end
+        end
+
+        local args = table.pack(...)
+        local key = label .. "|" .. DescribeArgs(args, args.n)
+        local now = tick()
+        if key == LastKey and now - LastTime < 0.05 then return end -- other hook layer already saw it
+        LastKey, LastTime = key, now
+
+        if SelfCalls > 0 then
+            SelfCalls = SelfCalls - 1 -- our own call (playback/auto), already logged
+            return
+        end
+        OnGameRemote(label, method, table.unpack(args, 1, args.n))
+    end
+
+    local function HookRemoteMethod(className, methodName)
+        local ok, err = pcall(function()
+            local probe = Instance.new(className)
+            local orig
+            orig = hookfunction(probe[methodName], newcclosure(function(self, ...)
+                pcall(HandleRemoteCall, self, methodName, ...)
+                return orig(self, ...)
+            end))
+            probe:Destroy()
+        end)
+        if ok then
+            Log("info", "Hooked " .. className .. "." .. methodName)
+        else
+            Log("warn", "Could not hook " .. className .. "." .. methodName .. ": " .. tostring(err))
         end
     end
 
@@ -844,24 +1172,42 @@ if IsInMatch() then
         local ok, Events = pcall(function()
             return ReplicatedStorage:WaitForChild("Events", 15)
         end)
-        if not (ok and Events) then return end
+        if not (ok and Events) then
+            Log("error", "ReplicatedStorage.Events not found after 15s; recording and playback unavailable")
+            return
+        end
 
         for _, inst in ipairs(Events:GetDescendants()) do
             RegisterRemote(inst)
         end
+        scanned = true
         Events.DescendantAdded:Connect(RegisterRemote)
+
+        local labels = {}
+        for _, label in pairs(TargetRemotes) do labels[#labels + 1] = label end
+        table.sort(labels)
+        Log("info", string.format("Tracking %d remotes: %s", #labels, table.concat(labels, ", ")))
 
         local OldNamecall
         OldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
             local method = getnamecallmethod()
-            if Recording and (method == "InvokeServer" or method == "FireServer") then
-                local label = TargetRemotes[self]
-                if label then
-                    RecordAction(label, method, ...)
-                end
+            if method == "InvokeServer" or method == "FireServer" then
+                local ok, err = pcall(HandleRemoteCall, self, method, ...)
+                if not ok then task.defer(Log, "error", "Remote hook error: " .. tostring(err)) end
+                if setnamecallmethod then setnamecallmethod(method) end -- nested namecalls can overwrite it
             end
             return OldNamecall(self, ...)
         end))
+
+        -- Also hook the method functions themselves: calls that don't use obj:Method()
+        -- syntax (pcall(remote.InvokeServer, remote, ...), cached method references)
+        -- never reach __namecall. HandleRemoteCall dedupes calls both layers see.
+        HookRemoteMethod("RemoteFunction", "InvokeServer")
+        HookRemoteMethod("RemoteEvent", "FireServer")
+        HookRemoteMethod("UnreliableRemoteEvent", "FireServer")
+
+        HookInstalled = true
+        Log("info", "Remote hooks installed")
     end)
 
     -- Resume any toggles that were saved as on, now that everything above is set up
@@ -869,4 +1215,138 @@ if IsInMatch() then
     if MatchConfig.AutoReplay then StartAutoReplay() end
     if MatchConfig.AutoPlayMacro then StartAutoPlayMacro() end
     print("[TDR] Match tab built.")
+end
+
+-- ═════════════════════════════════════════════════════════════════════
+-- LOG TAB — live view of what the script sends, receives and decides.
+-- Entries logged before this tab exists are buffered and flushed here.
+-- ═════════════════════════════════════════════════════════════════════
+do
+    local LOG_COLORS = {
+        info  = Color3.fromRGB(170, 170, 175),
+        send  = Color3.fromRGB(110, 170, 255),
+        ok    = Color3.fromRGB(100, 200, 130),
+        warn  = Color3.fromRGB(230, 190, 80),
+        error = Color3.fromRGB(235, 95, 95),
+    }
+
+    local Tab = Lib:AddTab("Log", "full")
+    local Root = Tab.Content
+    AddPadding(Root, 4)
+
+    local Box = Instance.new("Frame", Root)
+    Box.Size = UDim2.new(1, 0, 1, 0)
+    Box.BackgroundColor3 = Color3.fromRGB(20, 20, 23)
+    Box.BackgroundTransparency = 0.3
+    Instance.new("UICorner", Box).CornerRadius = UDim.new(0, 10)
+
+    local Title = Instance.new("TextLabel", Box)
+    Title.Size = UDim2.new(0, 60, 0, 22)
+    Title.Position = UDim2.new(0, 10, 0, 6)
+    Title.BackgroundTransparency = 1
+    Title.Text = "Log"
+    Title.TextColor3 = Color3.fromRGB(230, 230, 230)
+    Title.TextSize = 13
+    Title.Font = Enum.Font.GothamBold
+    Title.TextXAlignment = Enum.TextXAlignment.Left
+
+    local function MakeBarButton(text, rightOffset, width)
+        local b = Instance.new("TextButton", Box)
+        b.Size = UDim2.new(0, width, 0, 22)
+        b.AnchorPoint = Vector2.new(1, 0)
+        b.Position = UDim2.new(1, -rightOffset, 0, 6)
+        b.BackgroundColor3 = Color3.fromRGB(55, 55, 60)
+        b.Text = text
+        b.TextColor3 = Color3.fromRGB(230, 230, 230)
+        b.TextSize = 11
+        b.Font = Enum.Font.GothamMedium
+        b.AutoButtonColor = false
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+        return b
+    end
+
+    local ClearBtn = MakeBarButton("Clear", 8, 50)
+    local CopyBtn  = MakeBarButton("Copy", 64, 50)
+    local SpyBtn   = MakeBarButton("Spy: ON", 120, 70)
+
+    local List = Instance.new("ScrollingFrame", Box)
+    List.Size = UDim2.new(1, -12, 1, -40)
+    List.Position = UDim2.new(0, 6, 0, 34)
+    List.BackgroundTransparency = 1
+    List.BorderSizePixel = 0
+    List.ScrollBarThickness = 4
+    List.CanvasSize = UDim2.new(0, 0, 0, 0)
+    List.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    List.ClipsDescendants = true
+
+    local ListLayout = Instance.new("UIListLayout", List)
+    ListLayout.Padding = UDim.new(0, 2)
+    ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+    local Rows = {}
+    local rowOrder = 0
+
+    local function AddRow(entry)
+        local nearBottom = List.CanvasPosition.Y + List.AbsoluteWindowSize.Y >= List.AbsoluteCanvasSize.Y - 24
+        rowOrder = rowOrder + 1
+
+        local row = Instance.new("TextLabel", List)
+        row.Size = UDim2.new(1, -6, 0, 0)
+        row.AutomaticSize = Enum.AutomaticSize.Y
+        row.BackgroundTransparency = 1
+        row.LayoutOrder = rowOrder
+        row.Font = Enum.Font.Code
+        row.TextSize = 11
+        row.TextWrapped = true
+        row.TextXAlignment = Enum.TextXAlignment.Left
+        row.TextYAlignment = Enum.TextYAlignment.Top
+        row.TextColor3 = LOG_COLORS[entry.level] or LOG_COLORS.info
+        row.Text = string.format("[%s] %s", entry.time, entry.text)
+
+        table.insert(Rows, row)
+        if #Rows > MAX_LOG_LINES then
+            table.remove(Rows, 1):Destroy()
+        end
+
+        if nearBottom then -- only follow the tail if you were already at the bottom
+            task.delay(0.03, function()
+                List.CanvasPosition = Vector2.new(0, math.max(0, List.AbsoluteCanvasSize.Y - List.AbsoluteWindowSize.Y))
+            end)
+        end
+    end
+
+    ClearBtn.MouseButton1Click:Connect(function()
+        for _, r in ipairs(Rows) do r:Destroy() end
+        table.clear(Rows)
+        table.clear(LogEntries)
+    end)
+
+    CopyBtn.MouseButton1Click:Connect(function()
+        local lines = {}
+        for _, e in ipairs(LogEntries) do
+            lines[#lines + 1] = string.format("[%s][%s] %s", e.time, e.level, e.text)
+        end
+        local clip = setclipboard or toclipboard
+        if clip then
+            clip(table.concat(lines, "\n"))
+            Log("ok", "Copied " .. #lines .. " log lines to the clipboard")
+        else
+            Log("warn", "This executor has no clipboard function")
+        end
+    end)
+
+    local function RefreshSpyButton()
+        SpyBtn.Text = LogGameRemotes and "Spy: ON" or "Spy: OFF"
+        SpyBtn.BackgroundColor3 = LogGameRemotes and Color3.fromRGB(60, 110, 170) or Color3.fromRGB(55, 55, 60)
+    end
+    RefreshSpyButton()
+
+    SpyBtn.MouseButton1Click:Connect(function()
+        LogGameRemotes = not LogGameRemotes
+        RefreshSpyButton()
+    end)
+
+    for _, entry in ipairs(LogEntries) do AddRow(entry) end
+    LogSink = AddRow
+    print("[TDR] Log tab built.")
 end
