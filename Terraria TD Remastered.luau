@@ -277,9 +277,11 @@ if IsInMatch() then
     local MatchConfig = {
         AutoReplay        = false,
         AutoCollectItems  = false,
+        CollectMode       = "TouchInterest",
         AutoPlayMacro     = false,
         SelectedMacroName = nil,
     }
+    local COLLECT_MODES = {"TouchInterest", "Teleport", "MoveTo"}
 
     local function LoadMatchConfig()
         local ok, result = pcall(function()
@@ -305,6 +307,9 @@ if IsInMatch() then
     end
 
     LoadMatchConfig()
+    if not table.find(COLLECT_MODES, MatchConfig.CollectMode) then
+        MatchConfig.CollectMode = "TouchInterest"
+    end
 
     -- Forward-declared so earlier UI closures can call later definitions
     local Macros = {}
@@ -315,6 +320,15 @@ if IsInMatch() then
     local HookInstalled = false
     local SelfCalls = 0               -- lets the remote spy skip calls this script makes itself
     local PlayMacro, RunMacro, AddMacroListEntry, SaveMacros, LoadMacros
+
+    local MacroLabels = {}            -- [macro] = its label in the Macros list
+    local MacroListeners = {}         -- called when macros are added / renamed / deleted
+    local function NotifyMacros()
+        for _, fn in ipairs(MacroListeners) do
+            local ok, err = pcall(fn)
+            if not ok then Log("error", "Macro list refresh failed: " .. tostring(err)) end
+        end
+    end
 
     -- Fires a remote using the right method for its class (never trusts a stored
     -- method name), returns pcall's (ok, result). Packs varargs HERE, not in the
@@ -556,30 +570,118 @@ if IsInMatch() then
 
     -- ── Auto-Collect Items: touch every part under workspace.Drops that
     -- actually has a TouchTransmitter (meaning something listens for touch) ─
-    local AutoCollectConnection = nil
+    -- Three ways to pick them up (MatchConfig.CollectMode, switchable live):
+    --   TouchInterest  firetouchinterest from your root part, no movement
+    --   Teleport       hop onto each drop, then back to where you were
+    --   MoveTo         walk to the nearest drop (skips ones just visited / unreachable)
+    local AutoCollectRunning = false
 
-    local function StartAutoCollect()
-        if AutoCollectConnection then return end
-        AutoCollectConnection = RunService.Heartbeat:Connect(function()
-            local character  = LocalPlayer.Character
-            local hrp        = character and character:FindFirstChild("HumanoidRootPart")
-            local dropsFolder = Workspace:FindFirstChild("Drops")
-            if not (hrp and dropsFolder) then return end
-
-            for _, part in ipairs(dropsFolder:GetDescendants()) do
+    local function GetCollectTargets()
+        local targets = {}
+        local folder = Workspace:FindFirstChild("Drops")
+        if folder then
+            for _, part in ipairs(folder:GetDescendants()) do
                 if part:IsA("BasePart") and part:FindFirstChildOfClass("TouchTransmitter") then
-                    firetouchinterest(hrp, part, 0)
-                    firetouchinterest(hrp, part, 1)
+                    targets[#targets + 1] = part
                 end
             end
-        end)
+        end
+        return targets
     end
 
-    local function StopAutoCollect()
-        if AutoCollectConnection then
-            AutoCollectConnection:Disconnect()
-            AutoCollectConnection = nil
-        end
+    local function StartAutoCollect()
+        if AutoCollectRunning then return end
+        AutoCollectRunning = true
+        task.spawn(function()
+            local lastMode = nil
+            local visited = {}          -- [part] = tick() it was last visited (MoveTo)
+            local warnedTouch = false
+
+            while MatchConfig.AutoCollectItems do
+                local mode      = MatchConfig.CollectMode
+                local character = LocalPlayer.Character
+                local hrp       = character and character:FindFirstChild("HumanoidRootPart")
+                local hum       = character and character:FindFirstChildOfClass("Humanoid")
+
+                if mode ~= lastMode then
+                    Log("info", "Auto-Collect mode: " .. mode)
+                    lastMode = mode
+                end
+
+                if not hrp then
+                    task.wait(0.5) -- dead / respawning
+
+                elseif mode == "TouchInterest" then
+                    if firetouchinterest then
+                        for _, part in ipairs(GetCollectTargets()) do
+                            firetouchinterest(hrp, part, 0)
+                            firetouchinterest(hrp, part, 1)
+                        end
+                    elseif not warnedTouch then
+                        warnedTouch = true
+                        Log("error", "This executor has no firetouchinterest; use Teleport or MoveTo")
+                    end
+                    RunService.Heartbeat:Wait()
+
+                elseif mode == "Teleport" then
+                    local targets = GetCollectTargets()
+                    if #targets == 0 then
+                        task.wait(0.25)
+                    else
+                        local home = hrp.CFrame
+                        for _, part in ipairs(targets) do
+                            if not MatchConfig.AutoCollectItems or not hrp.Parent then break end
+                            if part.Parent then
+                                hrp.CFrame = part.CFrame
+                                task.wait(0.05) -- give the touch a physics step to register
+                            end
+                        end
+                        if hrp.Parent then
+                            hrp.CFrame = home
+                            hrp.AssemblyLinearVelocity = Vector3.zero
+                        end
+                        task.wait(0.25)
+                    end
+
+                elseif mode == "MoveTo" then
+                    local now = tick()
+                    local best, bestDist = nil, math.huge
+                    for _, part in ipairs(GetCollectTargets()) do
+                        local seen = visited[part]
+                        if not (seen and now - seen < 5) then
+                            local d = (part.Position - hrp.Position).Magnitude
+                            if d < bestDist then best, bestDist = part, d end
+                        end
+                    end
+
+                    if best and hum then
+                        hum:MoveTo(best.Position)
+                        local t0 = tick()
+                        while MatchConfig.AutoCollectItems
+                            and MatchConfig.CollectMode == "MoveTo"
+                            and best.Parent
+                            and hrp.Parent
+                            and tick() - t0 < 4
+                            and (hrp.Position - best.Position).Magnitude > 3 do
+                            task.wait(0.1)
+                        end
+                        visited[best] = tick() -- reached, collected, or timed out: don't loop on it
+                    else
+                        task.wait(0.25)
+                    end
+
+                else
+                    task.wait(0.5)
+                end
+            end
+
+            -- stop any walk in progress
+            local character = LocalPlayer.Character
+            local hrp = character and character:FindFirstChild("HumanoidRootPart")
+            local hum = character and character:FindFirstChildOfClass("Humanoid")
+            if hrp and hum and lastMode == "MoveTo" then hum:MoveTo(hrp.Position) end
+            AutoCollectRunning = false
+        end)
     end
 
     -- ── Shared remote-fire helper (used by Auto-Replay) ─────────────────────
@@ -690,18 +792,61 @@ if IsInMatch() then
         if state then StartAutoReplay() end
     end)
 
-    MakeCustomToggle(TogglesHolder, "Auto-Collect Items", MatchConfig.AutoCollectItems, function(state)
-        MatchConfig.AutoCollectItems = state
-        SaveMatchConfig()
-        Log("info", "Auto-Collect Items " .. (state and "ON" or "OFF"))
-        if state then StartAutoCollect() else StopAutoCollect() end
-    end)
-
     MakeCustomToggle(TogglesHolder, "Auto-Play Macro", MatchConfig.AutoPlayMacro, function(state)
         MatchConfig.AutoPlayMacro = state
         SaveMatchConfig()
         Log("info", "Auto-Play Macro " .. (state and "ON" or "OFF"))
         if state then StartAutoPlayMacro() end
+    end)
+
+    MakeCustomToggle(TogglesHolder, "Auto-Collect Items", MatchConfig.AutoCollectItems, function(state)
+        MatchConfig.AutoCollectItems = state
+        SaveMatchConfig()
+        Log("info", "Auto-Collect Items " .. (state and "ON" or "OFF"))
+        if state then StartAutoCollect() end -- turning it off ends the loop on its own
+    end)
+
+    -- Mode selector sits right under the Auto-Collect toggle: click to cycle
+    local function MakeModeRow(parent, labelText, options, initial, callback)
+        local row = Instance.new("Frame", parent)
+        row.Size = UDim2.new(1, 0, 0, 34)
+        row.BackgroundColor3 = Color3.fromRGB(25, 25, 28)
+        row.BackgroundTransparency = 0.3
+        Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+
+        local label = Instance.new("TextLabel", row)
+        label.Size = UDim2.new(0, 38, 1, 0)
+        label.Position = UDim2.new(0, 10, 0, 0)
+        label.BackgroundTransparency = 1
+        label.Text = labelText
+        label.TextColor3 = Color3.fromRGB(230, 230, 230)
+        label.TextScaled = true
+        label.Font = Enum.Font.GothamMedium
+        label.TextXAlignment = Enum.TextXAlignment.Left
+
+        local btn = Instance.new("TextButton", row)
+        btn.Size = UDim2.new(1, -60, 0, 22)
+        btn.Position = UDim2.new(0, 52, 0.5, -11)
+        btn.BackgroundColor3 = Color3.fromRGB(55, 55, 60)
+        btn.TextColor3 = Color3.fromRGB(235, 235, 235)
+        btn.TextScaled = true
+        btn.Font = Enum.Font.GothamBold
+        btn.AutoButtonColor = false
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+
+        local index = table.find(options, initial) or 1
+        btn.Text = options[index]
+        btn.MouseButton1Click:Connect(function()
+            index = index % #options + 1
+            btn.Text = options[index]
+            if callback then callback(options[index]) end
+        end)
+        return row
+    end
+
+    MakeModeRow(TogglesHolder, "Mode", COLLECT_MODES, MatchConfig.CollectMode, function(mode)
+        MatchConfig.CollectMode = mode
+        SaveMatchConfig()
     end)
 
     -- ── Macro persistence (CFrame/Vector3 aren't JSON-safe, so wrap them) ─
@@ -792,6 +937,7 @@ if IsInMatch() then
         label.TextXAlignment = Enum.TextXAlignment.Left
         label.TextTruncate = Enum.TextTruncate.AtEnd
         label.AutoButtonColor = false
+        MacroLabels[macro] = label
 
         local SelectBtn = Instance.new("TextButton", row)
         SelectBtn.Size = UDim2.new(0, 40, 0, 20)
@@ -856,8 +1002,10 @@ if IsInMatch() then
                 MatchConfig.SelectedMacroName = nil
                 SaveMatchConfig()
             end
+            MacroLabels[macro] = nil
             row:Destroy()
             SaveMacros()
+            NotifyMacros()
         end)
 
         -- Double-click the label (two clicks within 0.4s) to rename in place
@@ -895,6 +1043,7 @@ if IsInMatch() then
                             SaveMatchConfig()
                         end
                         SaveMacros()
+                        NotifyMacros()
                     end
                     editBox:Destroy()
                     label.Visible = true
@@ -1061,6 +1210,7 @@ if IsInMatch() then
                 table.insert(Macros, CurrentMacro)
                 AddMacroListEntry(CurrentMacro)
                 SaveMacros()
+                NotifyMacros()
             end
             CurrentMacro = nil
             NameBox.Text = ""
@@ -1209,6 +1359,320 @@ if IsInMatch() then
         HookInstalled = true
         Log("info", "Remote hooks installed")
     end)
+
+    -- ═══ Macro Editor tab ═══════════════════════════════════════════════
+    -- Left: pick a macro. Right: its actions in order, each with an editable
+    -- time and mana cost, a test-fire button and delete. Every edit saves.
+    do
+        local ETab  = Lib:AddTab("Editor", "full")
+        local ERoot = ETab.Content
+        AddPadding(ERoot, 4)
+
+        local EditingMacro = nil
+        local RebuildActions
+
+        local function MakeLabel(parent, text, size, pos)
+            local l = Instance.new("TextLabel", parent)
+            l.Size = size
+            l.Position = pos
+            l.BackgroundTransparency = 1
+            l.Text = text
+            l.TextColor3 = Color3.fromRGB(230, 230, 230)
+            l.TextSize = 13
+            l.Font = Enum.Font.GothamBold
+            l.TextXAlignment = Enum.TextXAlignment.Left
+            l.TextTruncate = Enum.TextTruncate.AtEnd
+            return l
+        end
+
+        local function MakeButton(parent, text, size, pos, color)
+            local b = Instance.new("TextButton", parent)
+            b.Size = size
+            b.Position = pos
+            b.BackgroundColor3 = color or Color3.fromRGB(55, 55, 60)
+            b.Text = text
+            b.TextColor3 = Color3.fromRGB(235, 235, 235)
+            b.TextSize = 10
+            b.Font = Enum.Font.GothamBold
+            b.AutoButtonColor = false
+            Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+            return b
+        end
+
+        local function MakeInput(parent, placeholder, size, pos)
+            local t = Instance.new("TextBox", parent)
+            t.Size = size
+            t.Position = pos
+            t.BackgroundColor3 = Color3.fromRGB(25, 25, 28)
+            t.BackgroundTransparency = 0.2
+            t.PlaceholderText = placeholder
+            t.PlaceholderColor3 = Color3.fromRGB(120, 120, 125)
+            t.Text = ""
+            t.TextColor3 = Color3.fromRGB(220, 220, 225)
+            t.TextSize = 11
+            t.Font = Enum.Font.Gotham
+            t.ClearTextOnFocus = false
+            Instance.new("UICorner", t).CornerRadius = UDim.new(0, 6)
+            return t
+        end
+
+        -- Left box: macro picker
+        local PickBox = Instance.new("Frame", ERoot)
+        PickBox.Size = UDim2.new(0.3, -6, 1, 0)
+        PickBox.BackgroundColor3 = Color3.fromRGB(20, 20, 23)
+        PickBox.BackgroundTransparency = 0.3
+        Instance.new("UICorner", PickBox).CornerRadius = UDim.new(0, 10)
+        MakeLabel(PickBox, "Macros", UDim2.new(1, -12, 0, 22), UDim2.new(0, 8, 0, 6))
+
+        local PickList = Instance.new("ScrollingFrame", PickBox)
+        PickList.Size = UDim2.new(1, -12, 1, -38)
+        PickList.Position = UDim2.new(0, 6, 0, 32)
+        PickList.BackgroundTransparency = 1
+        PickList.BorderSizePixel = 0
+        PickList.ScrollBarThickness = 4
+        PickList.CanvasSize = UDim2.new(0, 0, 0, 0)
+        PickList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        PickList.ClipsDescendants = true
+        local PickLayout = Instance.new("UIListLayout", PickList)
+        PickLayout.Padding = UDim.new(0, 4)
+        PickLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+        -- Right box: the open macro's actions
+        local EditBox = Instance.new("Frame", ERoot)
+        EditBox.Size = UDim2.new(0.7, -6, 1, 0)
+        EditBox.Position = UDim2.new(0.3, 6, 0, 0)
+        EditBox.BackgroundColor3 = Color3.fromRGB(20, 20, 23)
+        EditBox.BackgroundTransparency = 0.3
+        Instance.new("UICorner", EditBox).CornerRadius = UDim.new(0, 10)
+
+        local EditTitle = MakeLabel(EditBox, "Select a macro to edit", UDim2.new(1, -20, 0, 22), UDim2.new(0, 10, 0, 6))
+        local ShiftBox  = MakeInput(EditBox, "shift (s)", UDim2.new(0, 60, 0, 24), UDim2.new(0, 6, 0, 32))
+        local ShiftBtn  = MakeButton(EditBox, "Shift all", UDim2.new(0, 70, 0, 24), UDim2.new(0, 72, 0, 32))
+        local DupBtn    = MakeButton(EditBox, "Duplicate", UDim2.new(0, 76, 0, 24), UDim2.new(0, 148, 0, 32))
+
+        local ActionList = Instance.new("ScrollingFrame", EditBox)
+        ActionList.Size = UDim2.new(1, -12, 1, -68)
+        ActionList.Position = UDim2.new(0, 6, 0, 62)
+        ActionList.BackgroundTransparency = 1
+        ActionList.BorderSizePixel = 0
+        ActionList.ScrollBarThickness = 4
+        ActionList.CanvasSize = UDim2.new(0, 0, 0, 0)
+        ActionList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        ActionList.ClipsDescendants = true
+        local ActionLayout = Instance.new("UIListLayout", ActionList)
+        ActionLayout.Padding = UDim.new(0, 4)
+        ActionLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+        -- helpers
+        local function UpdateTitle()
+            if EditingMacro then
+                local last = EditingMacro.Actions[#EditingMacro.Actions]
+                EditTitle.Text = string.format("%s  (%d actions, %.1fs)",
+                    EditingMacro.Name, #EditingMacro.Actions, last and last.t or 0)
+            else
+                EditTitle.Text = "Select a macro to edit"
+            end
+        end
+
+        local function SyncMainLabel()
+            local lbl = EditingMacro and MacroLabels[EditingMacro]
+            if lbl then
+                lbl.Text = string.format("%s  (%d)", EditingMacro.Name, #EditingMacro.Actions)
+            end
+        end
+
+        local function SortActions(macro) -- stable: equal times keep their order
+            for i, a in ipairs(macro.Actions) do a._order = i end
+            table.sort(macro.Actions, function(x, y)
+                if x.t ~= y.t then return x.t < y.t end
+                return x._order < y._order
+            end)
+            for _, a in ipairs(macro.Actions) do a._order = nil end
+        end
+
+        local function UniqueName(base)
+            local name, n = base, 1
+            local function taken(nm)
+                for _, m in ipairs(Macros) do
+                    if m.Name == nm then return true end
+                end
+                return false
+            end
+            while taken(name) do
+                n = n + 1
+                name = base .. " " .. n
+            end
+            return name
+        end
+
+        local function CloneMacro(macro)
+            local copy = {Name = UniqueName(macro.Name .. " copy"), Actions = {}}
+            for i, a in ipairs(macro.Actions) do
+                local args = {}
+                for k, v in ipairs(a.args) do args[k] = v end
+                copy.Actions[i] = {t = a.t, remote = a.remote, method = a.method, mana = a.mana, args = args}
+            end
+            return copy
+        end
+
+        local function BuildRow(macro, i, action)
+            local row = Instance.new("Frame", ActionList)
+            row.Size = UDim2.new(1, 0, 0, 40)
+            row.LayoutOrder = i
+            row.BackgroundColor3 = Color3.fromRGB(30, 30, 34)
+            row.BackgroundTransparency = 0.3
+            Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+
+            local timeBox = MakeInput(row, "sec", UDim2.new(0, 52, 0, 22), UDim2.new(0, 6, 0.5, -11))
+            timeBox.Text = string.format("%.2f", action.t)
+            timeBox.FocusLost:Connect(function()
+                local n = tonumber(timeBox.Text)
+                if n and n >= 0 then
+                    action.t = n
+                    SortActions(macro)
+                    SaveMacros()
+                    RebuildActions()
+                else
+                    timeBox.Text = string.format("%.2f", action.t)
+                end
+            end)
+
+            local info = Instance.new("TextLabel", row)
+            info.Size = UDim2.new(1, -184, 1, 0)
+            info.Position = UDim2.new(0, 64, 0, 0)
+            info.BackgroundTransparency = 1
+            info.Font = Enum.Font.Gotham
+            info.TextSize = 11
+            info.TextColor3 = Color3.fromRGB(210, 210, 215)
+            info.TextXAlignment = Enum.TextXAlignment.Left
+            info.TextWrapped = true
+            info.TextTruncate = Enum.TextTruncate.AtEnd
+            info.Text = string.format("%d. %s\n%s", i, action.remote, DescribeArgs(action.args))
+
+            local manaBox = MakeInput(row, "mana", UDim2.new(0, 44, 0, 22), UDim2.new(1, -114, 0.5, -11))
+            manaBox.Text = action.mana and tostring(action.mana) or ""
+            manaBox.FocusLost:Connect(function()
+                local txt = manaBox.Text
+                local n = tonumber(txt)
+                if txt == "" then
+                    action.mana = nil
+                    SaveMacros()
+                elseif n and n >= 0 then
+                    action.mana = n > 0 and math.ceil(n) or nil
+                    manaBox.Text = action.mana and tostring(action.mana) or ""
+                    SaveMacros()
+                else
+                    manaBox.Text = action.mana and tostring(action.mana) or ""
+                end
+            end)
+
+            local testBtn = MakeButton(row, "Test", UDim2.new(0, 34, 0, 22), UDim2.new(1, -66, 0.5, -11),
+                Color3.fromRGB(60, 150, 90))
+            testBtn.MouseButton1Click:Connect(function()
+                local remote = RemotesByLabel[action.remote]
+                local tag = string.format("EDIT #%d %s", i, action.remote)
+                if not remote then
+                    Log("error", tag .. " - remote not found")
+                else
+                    Log("send", string.format(">> %s(%s)", tag, DescribeArgs(action.args)))
+                    task.spawn(function()
+                        local ok, res = CallRemote(remote, table.unpack(action.args))
+                        if ok then
+                            Log("ok", "<< " .. tag .. " returned " .. Describe(res))
+                        else
+                            Log("error", "<< " .. tag .. " error: " .. tostring(res))
+                        end
+                    end)
+                end
+            end)
+
+            local delBtn = MakeButton(row, "✕", UDim2.new(0, 22, 0, 22), UDim2.new(1, -28, 0.5, -11),
+                Color3.fromRGB(150, 50, 50))
+            delBtn.MouseButton1Click:Connect(function()
+                table.remove(macro.Actions, i)
+                SaveMacros()
+                RebuildActions()
+            end)
+        end
+
+        RebuildActions = function()
+            for _, child in ipairs(ActionList:GetChildren()) do
+                if child:IsA("Frame") then child:Destroy() end -- keep the UIListLayout
+            end
+            if EditingMacro then
+                for i, action in ipairs(EditingMacro.Actions) do
+                    BuildRow(EditingMacro, i, action)
+                end
+            end
+            UpdateTitle()
+            SyncMainLabel()
+        end
+
+        local function RefreshPicker()
+            for _, child in ipairs(PickList:GetChildren()) do
+                if child:IsA("TextButton") then child:Destroy() end
+            end
+
+            local stillExists = false
+            for _, macro in ipairs(Macros) do
+                if macro == EditingMacro then stillExists = true end
+
+                local btn = Instance.new("TextButton", PickList)
+                btn.Size = UDim2.new(1, 0, 0, 26)
+                btn.BackgroundColor3 = (macro == EditingMacro) and Color3.fromRGB(45, 65, 90) or Color3.fromRGB(30, 30, 34)
+                btn.BackgroundTransparency = 0.3
+                btn.Text = "  " .. macro.Name
+                btn.TextColor3 = Color3.fromRGB(210, 210, 215)
+                btn.TextSize = 12
+                btn.Font = Enum.Font.Gotham
+                btn.TextXAlignment = Enum.TextXAlignment.Left
+                btn.TextTruncate = Enum.TextTruncate.AtEnd
+                btn.AutoButtonColor = false
+                Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+                btn.MouseButton1Click:Connect(function()
+                    EditingMacro = macro
+                    RefreshPicker()
+                    RebuildActions()
+                end)
+            end
+
+            if EditingMacro and not stillExists then
+                EditingMacro = nil
+                RebuildActions()
+            else
+                UpdateTitle()
+            end
+        end
+
+        ShiftBtn.MouseButton1Click:Connect(function()
+            local d = tonumber(ShiftBox.Text)
+            if EditingMacro and d then
+                for _, a in ipairs(EditingMacro.Actions) do
+                    a.t = math.max(0, a.t + d)
+                end
+                SaveMacros()
+                RebuildActions()
+                Log("info", string.format("Editor: shifted '%s' by %+.2fs", EditingMacro.Name, d))
+            end
+        end)
+
+        DupBtn.MouseButton1Click:Connect(function()
+            if EditingMacro then
+                local copy = CloneMacro(EditingMacro)
+                table.insert(Macros, copy)
+                AddMacroListEntry(copy)
+                SaveMacros()
+                EditingMacro = copy
+                NotifyMacros()
+                RebuildActions()
+                Log("info", "Editor: duplicated as '" .. copy.Name .. "'")
+            end
+        end)
+
+        table.insert(MacroListeners, RefreshPicker)
+        RefreshPicker()
+        Log("info", "Editor tab built")
+    end
 
     -- Resume any toggles that were saved as on, now that everything above is set up
     if MatchConfig.AutoCollectItems then StartAutoCollect() end
