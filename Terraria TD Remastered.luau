@@ -277,6 +277,7 @@ if IsInMatch() then
     local MatchConfig = {
         AutoReplay        = false,
         AutoCollectItems  = false,
+        AutoUpgrade       = false,
         CollectMode       = "TouchInterest",
         AutoPlayMacro     = false,
         SelectedMacroName = nil,
@@ -400,6 +401,206 @@ if IsInMatch() then
             if conn.Connected then conn:Disconnect() end
             if CostWatcher == conn then CostWatcher = nil end
         end)
+    end
+
+    -- ── Unit data: exact costs from the game's own Units module ───────────────
+    -- require(ReplicatedStorage.Modules.Content.Units)[unitName].Upgrades[n].Cost,
+    -- where Upgrades[0].Cost is the placement cost. Placed units live in
+    -- workspace.Battle.Units with attributes ID and Upgrade (current level).
+    local UnitsData, unitsWarned = nil, false
+
+    local function GetUnitsData()
+        if UnitsData then return UnitsData end
+        local ok, result = pcall(function()
+            return require(ReplicatedStorage.Modules.Content.Units)
+        end)
+        if ok and type(result) == "table" then
+            UnitsData = result
+        elseif not unitsWarned then
+            unitsWarned = true
+            Log("warn", "Units data unavailable (ReplicatedStorage.Modules.Content.Units): " .. tostring(result))
+        end
+        return UnitsData
+    end
+
+    local function GetUnitsFolder()
+        local battle = Workspace:FindFirstChild("Battle")
+        return battle and battle:FindFirstChild("Units")
+    end
+
+    local function FindUnitById(id)
+        local folder = GetUnitsFolder()
+        if folder and id ~= nil then
+            for _, u in ipairs(folder:GetChildren()) do
+                if tostring(u:GetAttribute("ID")) == tostring(id) then return u end
+            end
+        end
+        return nil
+    end
+
+    local function WaitForUnit(id, timeout)
+        local deadline = tick() + (timeout or 2)
+        local unit = FindUnitById(id)
+        while not unit and tick() < deadline do
+            task.wait(0.1)
+            unit = FindUnitById(id)
+        end
+        return unit
+    end
+
+    local function GetPlaceCost(unitName)
+        local data = GetUnitsData()
+        local info = data and data[unitName]
+        local step = info and info.Upgrades and info.Upgrades[0]
+        return step and step.Cost
+    end
+
+    local function GetUpgradeCost(unit)
+        local data = GetUnitsData()
+        local info = data and data[unit.Name]
+        local nextLevel = (unit:GetAttribute("Upgrade") or 0) + 1
+        local step = info and info.Upgrades and info.Upgrades[nextLevel]
+        return step and step.Cost
+    end
+
+    -- Helpers below must never abort a playback: run them guarded
+    local function Safe(fn, ...)
+        local ok, a, b, c = pcall(fn, ...)
+        if ok then return a, b, c end
+        Log("error", "Unit helper failed: " .. tostring(a))
+        return nil
+    end
+
+    -- Exact cost of this place/upgrade right now (also returns the unit for
+    -- upgrades), falling back to the cost recorded with the macro.
+    local function RequiredMana(action)
+        if action.remote == "Battle.PlaceTower" then
+            local cost = GetPlaceCost(action.args[1])
+            if cost then return cost, "Units" end
+        elseif action.remote == "UI.UpgradeTower" then
+            local unit = WaitForUnit(action.args[1], 2) -- right after a placement it may not have replicated yet
+            if unit then
+                local cost = GetUpgradeCost(unit)
+                if cost then return cost, "Units", unit end
+            else
+                Log("warn", "UpgradeTower: no unit with ID " .. tostring(action.args[1]) .. " in workspace.Battle.Units (placement failed?)")
+            end
+        end
+        if action.mana and action.mana > 0 then return action.mana, "recorded" end
+        return nil
+    end
+
+    -- Info + sequencing: after a place/upgrade call returns, wait (max 1.5s) for the
+    -- change to show up so the next action sees fresh state, and log what happened.
+    local function SnapshotBefore(action, unit)
+        if action.remote == "Battle.PlaceTower" then
+            local ids = {}
+            local folder = GetUnitsFolder()
+            if folder then
+                for _, u in ipairs(folder:GetChildren()) do
+                    ids[tostring(u:GetAttribute("ID"))] = true
+                end
+            end
+            return {kind = "place", ids = ids}
+        elseif action.remote == "UI.UpgradeTower" and unit then
+            return {kind = "upgrade", unit = unit, level = unit:GetAttribute("Upgrade") or 0}
+        end
+        return nil
+    end
+
+    local function ConfirmAction(action, snap, tag)
+        if not snap then return end
+        local deadline = tick() + 1.5
+
+        if snap.kind == "place" then
+            local found = nil
+            while not found and tick() < deadline do
+                local folder = GetUnitsFolder()
+                if folder then
+                    for _, u in ipairs(folder:GetChildren()) do
+                        if u.Name == action.args[1] and not snap.ids[tostring(u:GetAttribute("ID"))] then
+                            found = u
+                        end
+                    end
+                end
+                if not found then task.wait(0.1) end
+            end
+            if found then
+                Log("ok", string.format("%s confirmed: %s placed (ID %s)", tag, found.Name, tostring(found:GetAttribute("ID"))))
+            else
+                Log("warn", tag .. " not confirmed: no new '" .. tostring(action.args[1]) .. "' in workspace.Battle.Units")
+            end
+
+        elseif snap.kind == "upgrade" then
+            while (snap.unit:GetAttribute("Upgrade") or 0) <= snap.level and snap.unit.Parent and tick() < deadline do
+                task.wait(0.1)
+            end
+            local now = snap.unit:GetAttribute("Upgrade") or 0
+            if now > snap.level then
+                Log("ok", string.format("%s confirmed: %s ID %s level %d -> %d",
+                    tag, snap.unit.Name, tostring(snap.unit:GetAttribute("ID")), snap.level, now))
+            else
+                Log("warn", string.format("%s not applied: %s ID %s still level %d",
+                    tag, snap.unit.Name, tostring(snap.unit:GetAttribute("ID")), snap.level))
+            end
+        end
+    end
+
+    -- While recording: exact cost from the Units data when possible, otherwise
+    -- measure the mana drop (WatchManaCost). Runs right after the call is captured,
+    -- before the server has applied it, so levels/IDs are still the "before" state.
+    -- While recording: learn which unit a placement created (its ID attribute), so the
+    -- Editor can group later upgrades / targeting / sell under the right unit.
+    local ClaimedUnitIds = {}
+
+    local function TrackPlacedUnit(action)
+        local before = {}
+        local folder = GetUnitsFolder()
+        if folder then
+            for _, u in ipairs(folder:GetChildren()) do
+                before[tostring(u:GetAttribute("ID"))] = true
+            end
+        end
+
+        local deadline = tick() + 3
+        while tick() < deadline do
+            folder = GetUnitsFolder()
+            if folder then
+                for _, u in ipairs(folder:GetChildren()) do
+                    local id = u:GetAttribute("ID")
+                    if id ~= nil and u.Name == action.args[1]
+                        and not before[tostring(id)] and not ClaimedUnitIds[tostring(id)] then
+                        ClaimedUnitIds[tostring(id)] = true
+                        action.unitId = id
+                        Log("info", string.format("REC %s placed as ID %s", tostring(action.args[1]), tostring(id)))
+                        return
+                    end
+                end
+            end
+            task.wait(0.1)
+        end
+        Log("warn", "REC could not read the new unit's ID for " .. tostring(action.args[1])
+            .. " (the Editor will assume placement order)")
+    end
+
+    local function CaptureCost(action)
+        if action.remote == "Battle.PlaceTower" then
+            task.spawn(TrackPlacedUnit, action)
+        end
+        local cost = nil
+        if action.remote == "Battle.PlaceTower" then
+            cost = GetPlaceCost(action.args[1])
+        elseif action.remote == "UI.UpgradeTower" then
+            local unit = FindUnitById(action.args[1])
+            if unit then cost = GetUpgradeCost(unit) end
+        end
+
+        if cost then
+            action.mana = cost
+            Log("info", string.format("REC %s costs %s mana (Units data)", action.remote, tostring(cost)))
+        else
+            WatchManaCost(action)
+        end
     end
 
     -- ── Left-top box: recorded macros list ──────────────────────────────
@@ -785,6 +986,101 @@ if IsInMatch() then
         end)
     end
 
+    -- ── Auto-Upgrade: keep spending mana on upgrades, one unit at a time ─────────
+    -- Picks the lowest-level unit first (ties: cheapest next upgrade, then lowest ID),
+    -- waits until its next upgrade is affordable, fires UI.UpgradeTower with the unit's
+    -- ID, and confirms the level went up. Costs come from the Units data; units with no
+    -- next upgrade are maxed and skipped. Pauses while a macro plays or Rewards is up.
+    local AutoUpgradeRunning = false
+
+    local function PickUpgradeTarget(failUntil)
+        local folder = GetUnitsFolder()
+        local data = GetUnitsData()
+        if not (folder and data) then return nil end
+
+        local best, bestLevel, bestCost, bestId = nil, 0, 0, 0
+        for _, unit in ipairs(folder:GetChildren()) do
+            local id = unit:GetAttribute("ID")
+            local info = data[unit.Name]
+            local ups = info and info.Upgrades
+            local cooling = failUntil[unit] and tick() < failUntil[unit]
+            if id ~= nil and ups and not cooling then
+                local level = unit:GetAttribute("Upgrade") or 0
+                local step = ups[level + 1]
+                if step and step.Cost then -- no next step = maxed
+                    local idNum = tonumber(id) or 0
+                    local better = not best
+                        or level < bestLevel
+                        or (level == bestLevel and (step.Cost < bestCost
+                            or (step.Cost == bestCost and idNum < bestId)))
+                    if better then best, bestLevel, bestCost, bestId = unit, level, step.Cost, idNum end
+                end
+            end
+        end
+        return best, bestCost, bestLevel
+    end
+
+    local function StartAutoUpgrade()
+        if AutoUpgradeRunning then return end
+        AutoUpgradeRunning = true
+        task.spawn(function()
+            local failUntil = {}   -- [unit] = tick() until which we leave it alone after a failed upgrade
+            local warnedData, warnedMana, pausedLogged = false, false, false
+
+            while MatchConfig.AutoUpgrade do
+                local rewards = GetRewardsFrame()
+                if Playing or (rewards and rewards.Visible) then
+                    if Playing and not pausedLogged then
+                        pausedLogged = true
+                        Log("info", "Auto-Upgrade paused while a macro plays")
+                    end
+                    task.wait(0.5)
+                else
+                    pausedLogged = false
+                    local mana = GetManaValue()
+                    if not GetUnitsData() then
+                        if not warnedData then
+                            warnedData = true
+                            Log("error", "Auto-Upgrade needs the Units data (ReplicatedStorage.Modules.Content.Units)")
+                        end
+                        task.wait(2)
+                    elseif not mana then
+                        if not warnedMana then
+                            warnedMana = true
+                            Log("warn", "Auto-Upgrade: mana value not found (PlayerGui.Main.Mana.Value)")
+                        end
+                        task.wait(1)
+                    else
+                        local unit, cost, level = PickUpgradeTarget(failUntil)
+                        if unit and mana.Value >= cost then
+                            local id = unit:GetAttribute("ID")
+                            local tag = string.format("AUTO %s ID %s", unit.Name, tostring(id))
+                            local snap = {kind = "upgrade", unit = unit, level = level}
+
+                            local done = false
+                            task.spawn(function()
+                                FireRemoteByLabel("UI.UpgradeTower", id)
+                                done = true
+                            end)
+                            local deadline = tick() + 5
+                            while not done and tick() < deadline do task.wait(0.05) end
+
+                            Safe(ConfirmAction, {remote = "UI.UpgradeTower", args = {id}}, snap, tag)
+                            if (unit:GetAttribute("Upgrade") or 0) <= level then
+                                failUntil[unit] = tick() + 3 -- didn't apply: leave it alone briefly
+                            end
+                        elseif unit then
+                            task.wait(0.2) -- saving up for it
+                        else
+                            task.wait(0.5) -- nothing upgradable right now
+                        end
+                    end
+                end
+            end
+            AutoUpgradeRunning = false
+        end)
+    end
+
     MakeCustomToggle(TogglesHolder, "Auto-Replay", MatchConfig.AutoReplay, function(state)
         MatchConfig.AutoReplay = state
         SaveMatchConfig()
@@ -849,6 +1145,13 @@ if IsInMatch() then
         SaveMatchConfig()
     end)
 
+    MakeCustomToggle(TogglesHolder, "Auto-Upgrade", MatchConfig.AutoUpgrade, function(state)
+        MatchConfig.AutoUpgrade = state
+        SaveMatchConfig()
+        Log("info", "Auto-Upgrade " .. (state and "ON" or "OFF"))
+        if state then StartAutoUpgrade() end
+    end)
+
     -- ── Macro persistence (CFrame/Vector3 aren't JSON-safe, so wrap them) ─
     local MACRO_FILE = SAVE_DIR .. "/macros.json"
 
@@ -882,7 +1185,7 @@ if IsInMatch() then
                 for k, v in ipairs(action.args) do
                     args[k] = SerializeValue(v)
                 end
-                actions[j] = {t = action.t, remote = action.remote, method = action.method, mana = action.mana, args = args}
+                actions[j] = {t = action.t, remote = action.remote, method = action.method, mana = action.mana, unitId = action.unitId, args = args}
             end
             out[i] = {Name = macro.Name, Actions = actions}
         end
@@ -898,7 +1201,7 @@ if IsInMatch() then
                 for k, v in ipairs(action.args) do
                     args[k] = DeserializeValue(v)
                 end
-                actions[j] = {t = action.t, remote = action.remote, method = action.method, mana = action.mana, args = args}
+                actions[j] = {t = action.t, remote = action.remote, method = action.method, mana = action.mana, unitId = action.unitId, args = args}
             end
             out[i] = {Name = macro.Name, Actions = actions}
         end
@@ -1087,15 +1390,17 @@ if IsInMatch() then
         local ran, err = pcall(function()
             Log("info", string.format("PLAY '%s' (%d actions)", macro.Name, total))
 
-            -- place/upgrade actions recorded before mana support have no cost to wait for
-            local unknownCost = 0
-            for _, a in ipairs(macro.Actions) do
-                if (a.remote == "Battle.PlaceTower" or a.remote == "UI.UpgradeTower") and not a.mana then
-                    unknownCost = unknownCost + 1
+            -- costs come from the game's Units data; the recorded cost is only a fallback
+            if not GetUnitsData() then
+                local unknownCost = 0
+                for _, a in ipairs(macro.Actions) do
+                    if (a.remote == "Battle.PlaceTower" or a.remote == "UI.UpgradeTower") and not a.mana then
+                        unknownCost = unknownCost + 1
+                    end
                 end
-            end
-            if unknownCost > 0 then
-                Log("warn", unknownCost .. " place/upgrade action(s) have no recorded mana cost; re-record to enable mana waiting")
+                if unknownCost > 0 then
+                    Log("warn", unknownCost .. " place/upgrade action(s) have no cost to wait for (no Units data, nothing recorded)")
+                end
             end
 
             local startedAt = tick()
@@ -1111,9 +1416,11 @@ if IsInMatch() then
                     missing = missing + 1
                     Log("error", tag .. " - remote not found, skipped")
                 else
-                    if action.mana and action.mana > 0 then
-                        WaitForMana(action.mana, tag)
+                    local need, source, unit = Safe(RequiredMana, action)
+                    if need and need > 0 then
+                        WaitForMana(need, tag .. " [" .. source .. "]")
                     end
+                    local snap = Safe(SnapshotBefore, action, unit)
 
                     Log("send", string.format(">> %s(%s) @%.1fs", tag, DescribeArgs(action.args), action.t))
                     pending = pending + 1
@@ -1142,6 +1449,7 @@ if IsInMatch() then
                         local deadline = tick() + 5
                         while not done and tick() < deadline do task.wait(0.05) end
                     end
+                    Safe(ConfirmAction, action, snap, tag)
                 end
 
                 local late = (tick() - startedAt) - target
@@ -1186,6 +1494,7 @@ if IsInMatch() then
             }
             RecordButton.Text = "Stop"
             RecordButton.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+            for k in pairs(ClaimedUnitIds) do ClaimedUnitIds[k] = nil end
             Log("info", "REC start '" .. CurrentMacro.Name .. "'")
             if not HookInstalled then
                 Log("error", "Remote hook is not installed, nothing will be captured")
@@ -1226,7 +1535,7 @@ if IsInMatch() then
             args = {...},
         }
         table.insert(CurrentMacro.Actions, action)
-        task.defer(WatchManaCost, action) -- measures what this call cost in mana
+        task.defer(CaptureCost, action) -- exact cost from Units data, else measures the mana drop
     end
 
     -- Every RemoteEvent/RemoteFunction under Events gets tracked dynamically
@@ -1449,10 +1758,12 @@ if IsInMatch() then
         local ShiftBox  = MakeInput(EditBox, "shift (s)", UDim2.new(0, 60, 0, 24), UDim2.new(0, 6, 0, 32))
         local ShiftBtn  = MakeButton(EditBox, "Shift all", UDim2.new(0, 70, 0, 24), UDim2.new(0, 72, 0, 32))
         local DupBtn    = MakeButton(EditBox, "Duplicate", UDim2.new(0, 76, 0, 24), UDim2.new(0, 148, 0, 32))
+        local ExpandBtn   = MakeButton(EditBox, "Expand all", UDim2.new(0, 76, 0, 24), UDim2.new(0, 6, 0, 60))
+        local CollapseBtn = MakeButton(EditBox, "Collapse all", UDim2.new(0, 82, 0, 24), UDim2.new(0, 88, 0, 60))
 
         local ActionList = Instance.new("ScrollingFrame", EditBox)
-        ActionList.Size = UDim2.new(1, -12, 1, -68)
-        ActionList.Position = UDim2.new(0, 6, 0, 62)
+        ActionList.Size = UDim2.new(1, -12, 1, -96)
+        ActionList.Position = UDim2.new(0, 6, 0, 90)
         ActionList.BackgroundTransparency = 1
         ActionList.BorderSizePixel = 0
         ActionList.ScrollBarThickness = 4
@@ -1510,15 +1821,93 @@ if IsInMatch() then
             for i, a in ipairs(macro.Actions) do
                 local args = {}
                 for k, v in ipairs(a.args) do args[k] = v end
-                copy.Actions[i] = {t = a.t, remote = a.remote, method = a.method, mana = a.mana, args = args}
+                copy.Actions[i] = {t = a.t, remote = a.remote, method = a.method, mana = a.mana, unitId = a.unitId, args = args}
             end
             return copy
         end
 
-        local function BuildRow(macro, i, action)
-            local row = Instance.new("Frame", ActionList)
-            row.Size = UDim2.new(1, 0, 0, 40)
-            row.LayoutOrder = i
+        -- Which unit groups are open (kept across rebuilds). Keys: a PlaceTower action
+        -- table, or the strings "other" / "orphan:<id>".
+        local Expanded = {}
+
+        -- A unit = its PlaceTower plus every action whose first argument is that unit's
+        -- ID (upgrade / targeting / sell). Macros recorded before unit IDs were saved
+        -- assume IDs count up from 0 in placement order (marked with a "?").
+        local function GroupActions(macro)
+            local groups, byId, orphans, other = {}, {}, {}, nil
+            local placeCount = 0
+
+            for i, a in ipairs(macro.Actions) do
+                if a.remote == "Battle.PlaceTower" then
+                    placeCount = placeCount + 1
+                    local id, guessed = a.unitId, false
+                    if id == nil then id, guessed = placeCount - 1, true end -- IDs start at 0
+                    local g = {key = a, unit = tostring(a.args[1]), id = id, guessed = guessed,
+                        items = {{i = i, action = a}}}
+                    groups[#groups + 1] = g
+                    if not byId[tostring(id)] then byId[tostring(id)] = g end
+                end
+            end
+
+            for i, a in ipairs(macro.Actions) do
+                if a.remote ~= "Battle.PlaceTower" then
+                    local id = a.args[1]
+                    local isUnitAction = string.find(a.remote, "Tower", 1, true)
+                        and (type(id) == "number" or tonumber(id) ~= nil)
+                    local g
+                    if isUnitAction then
+                        g = byId[tostring(id)]
+                        if not g then
+                            local key = "orphan:" .. tostring(id)
+                            g = orphans[key]
+                            if not g then
+                                g = {key = key, name = "Unit ID " .. tostring(id) .. " (no placement)", id = id, items = {}}
+                                orphans[key] = g
+                                groups[#groups + 1] = g
+                            end
+                        end
+                    else
+                        if not other then other = {key = "other", name = "Other actions", items = {}} end
+                        g = other
+                    end
+                    g.items[#g.items + 1] = {i = i, action = a}
+                end
+            end
+
+            if other then groups[#groups + 1] = other end
+            for _, g in ipairs(groups) do
+                table.sort(g.items, function(x, y) return x.i < y.i end)
+            end
+            return groups
+        end
+
+        -- Two-line label for one action: what it is (with its cost from the Units
+        -- data) and its arguments
+        local function DescribeItem(g, action, upgradeOrdinal)
+            local data = GetUnitsData()
+            local info = data and g.unit and data[g.unit]
+            local ups = info and info.Upgrades
+
+            if action.remote == "Battle.PlaceTower" then
+                local step = ups and ups[0]
+                return "Place" .. ((step and step.Cost) and ("  (cost " .. step.Cost .. ")") or ""),
+                    DescribeArgs(action.args)
+            elseif action.remote == "UI.UpgradeTower" then
+                local step = ups and ups[upgradeOrdinal]
+                return "Upgrade " .. upgradeOrdinal .. ((step and step.Cost) and ("  (cost " .. step.Cost .. ")") or ""),
+                    "ID " .. tostring(action.args[1])
+            elseif action.remote == "General.SellTower" then
+                return "Sell", "ID " .. DescribeArgs(action.args)
+            elseif action.remote == "Battle.TowerTargeting" then
+                return "Change target", "ID " .. DescribeArgs(action.args)
+            end
+            return action.remote, DescribeArgs(action.args)
+        end
+
+        local function BuildRow(macro, i, action, parent, order, line1, line2)
+            local row = Instance.new("Frame", parent)
+            row.Size = UDim2.new(1, -14, 0, 40)
+            row.LayoutOrder = order
             row.BackgroundColor3 = Color3.fromRGB(30, 30, 34)
             row.BackgroundTransparency = 0.3
             Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
@@ -1547,7 +1936,7 @@ if IsInMatch() then
             info.TextXAlignment = Enum.TextXAlignment.Left
             info.TextWrapped = true
             info.TextTruncate = Enum.TextTruncate.AtEnd
-            info.Text = string.format("%d. %s\n%s", i, action.remote, DescribeArgs(action.args))
+            info.Text = line1 .. "\n" .. line2
 
             local manaBox = MakeInput(row, "mana", UDim2.new(0, 44, 0, 22), UDim2.new(1, -114, 0.5, -11))
             manaBox.Text = action.mana and tostring(action.mana) or ""
@@ -1595,17 +1984,170 @@ if IsInMatch() then
             end)
         end
 
+        local UNIT_ACTIONS = {
+            upgrade = {label = "UI.UpgradeTower",       title = "Upgrade"},
+            sell    = {label = "General.SellTower",     title = "Sell"},
+            target  = {label = "Battle.TowerTargeting", title = "Change target"},
+        }
+
+        -- Insert a new action for this unit (its ID is the argument), one second after
+        -- the unit's last action. Adjust the time in the row that appears.
+        local function AddUnitAction(macro, g, kind)
+            local def = UNIT_ACTIONS[kind]
+            local last = g.items[#g.items]
+            local t = (last and last.action.t or 0) + 1
+
+            local remote = RemotesByLabel[def.label]
+            local action = {
+                t = t,
+                remote = def.label,
+                method = (remote and remote:IsA("RemoteEvent")) and "FireServer" or "InvokeServer",
+                args = {g.id},
+            }
+
+            if kind == "upgrade" and g.unit then
+                local data = GetUnitsData()
+                local ups = data and data[g.unit] and data[g.unit].Upgrades
+                local ordinal = 1
+                for _, item in ipairs(g.items) do
+                    if item.action.remote == "UI.UpgradeTower" then ordinal = ordinal + 1 end
+                end
+                local step = ups and ups[ordinal]
+                if step and step.Cost then
+                    action.mana = step.Cost
+                elseif ups then
+                    Log("warn", g.unit .. " has no upgrade " .. ordinal .. " (already max level)")
+                end
+            end
+
+            if not remote then
+                Log("warn", "Editor: remote " .. def.label .. " not found right now; added anyway")
+            end
+
+            table.insert(macro.Actions, action)
+            SortActions(macro)
+            Expanded[g.key] = true
+            SaveMacros()
+            RebuildActions()
+            Log("info", string.format("Editor: added %s for ID %s at %.2fs", def.title, tostring(g.id), t))
+        end
+
+        -- One collapsible group: header (click to open) + its action rows
+        local function BuildGroup(macro, g, order)
+            local frame = Instance.new("Frame", ActionList)
+            frame.Size = UDim2.new(1, 0, 0, 0)
+            frame.AutomaticSize = Enum.AutomaticSize.Y
+            frame.BackgroundTransparency = 1
+            frame.LayoutOrder = order
+            local layout = Instance.new("UIListLayout", frame)
+            layout.Padding = UDim.new(0, 3)
+            layout.SortOrder = Enum.SortOrder.LayoutOrder
+            layout.HorizontalAlignment = Enum.HorizontalAlignment.Right -- rows sit indented under the header
+
+            local open = Expanded[g.key] == true
+            local upgrades, others = 0, 0
+            for _, item in ipairs(g.items) do
+                local r = item.action.remote
+                if r == "UI.UpgradeTower" then
+                    upgrades = upgrades + 1
+                elseif r ~= "Battle.PlaceTower" then
+                    others = others + 1
+                end
+            end
+
+            local summary
+            if g.unit then
+                summary = string.format("%s  (ID %s%s)  @%.1fs  -  %d upgrade%s", g.unit, tostring(g.id),
+                    g.guessed and "?" or "", g.key.t, upgrades, upgrades == 1 and "" or "s")
+                if others > 0 then summary = summary .. string.format(", %d other", others) end
+            else
+                summary = string.format("%s  -  %d action%s", g.name, #g.items, #g.items == 1 and "" or "s")
+            end
+
+            local header = Instance.new("TextButton", frame)
+            header.Size = UDim2.new(1, 0, 0, 30)
+            header.LayoutOrder = 0
+            header.BackgroundColor3 = open and Color3.fromRGB(45, 65, 90) or Color3.fromRGB(35, 35, 40)
+            header.BackgroundTransparency = 0.2
+            header.Font = Enum.Font.GothamMedium
+            header.TextSize = 12
+            header.TextColor3 = Color3.fromRGB(230, 230, 230)
+            header.TextXAlignment = Enum.TextXAlignment.Left
+            header.TextTruncate = Enum.TextTruncate.AtEnd
+            header.AutoButtonColor = false
+            header.Text = (open and "[-]  " or "[+]  ") .. summary
+            Instance.new("UICorner", header).CornerRadius = UDim.new(0, 6)
+            local pad = Instance.new("UIPadding", header)
+            pad.PaddingLeft = UDim.new(0, 8)
+            pad.PaddingRight = UDim.new(0, 34)
+            header.MouseButton1Click:Connect(function()
+                Expanded[g.key] = not open
+                RebuildActions()
+            end)
+
+            if g.key ~= "other" then -- delete the whole unit (placement + everything under it)
+                local delGroup = MakeButton(header, "✕", UDim2.new(0, 22, 0, 22), UDim2.new(1, -26, 0.5, -11),
+                    Color3.fromRGB(150, 50, 50))
+                delGroup.MouseButton1Click:Connect(function()
+                    local indices = {}
+                    for _, item in ipairs(g.items) do indices[#indices + 1] = item.i end
+                    table.sort(indices, function(x, y) return x > y end) -- highest first so indices stay valid
+                    for _, idx in ipairs(indices) do table.remove(macro.Actions, idx) end
+                    SaveMacros()
+                    RebuildActions()
+                    Log("info", "Editor: removed " .. #indices .. " action(s) of " .. summary)
+                end)
+            end
+
+            if open then
+                local upgradeOrdinal = 0
+                for idx, item in ipairs(g.items) do
+                    if item.action.remote == "UI.UpgradeTower" then upgradeOrdinal = upgradeOrdinal + 1 end
+                    local line1, line2 = DescribeItem(g, item.action, upgradeOrdinal)
+                    BuildRow(macro, item.i, item.action, frame, idx, line1, line2)
+                end
+
+                if g.id ~= nil then -- add more actions to this unit
+                    local bar = Instance.new("Frame", frame)
+                    bar.Size = UDim2.new(1, -14, 0, 28)
+                    bar.LayoutOrder = #g.items + 1
+                    bar.BackgroundTransparency = 1
+                    local kinds = {
+                        {"upgrade", "+ Upgrade", Color3.fromRGB(60, 150, 90)},
+                        {"sell",    "+ Sell",    Color3.fromRGB(150, 50, 50)},
+                        {"target",  "+ Target",  Color3.fromRGB(60, 110, 170)},
+                    }
+                    for n, k in ipairs(kinds) do
+                        local btn = MakeButton(bar, k[2], UDim2.new(1 / 3, -4, 1, 0),
+                            UDim2.new((n - 1) / 3, 2, 0, 0), k[3])
+                        btn.MouseButton1Click:Connect(function()
+                            AddUnitAction(macro, g, k[1])
+                        end)
+                    end
+                end
+            end
+        end
+
         RebuildActions = function()
+            local scroll = ActionList.CanvasPosition
             for _, child in ipairs(ActionList:GetChildren()) do
                 if child:IsA("Frame") then child:Destroy() end -- keep the UIListLayout
             end
             if EditingMacro then
-                for i, action in ipairs(EditingMacro.Actions) do
-                    BuildRow(EditingMacro, i, action)
+                for order, g in ipairs(GroupActions(EditingMacro)) do
+                    BuildGroup(EditingMacro, g, order)
                 end
             end
             UpdateTitle()
             SyncMainLabel()
+            task.delay(0.05, function() ActionList.CanvasPosition = scroll end) -- keep your place after an edit
+        end
+
+        local function SetAllExpanded(open)
+            if EditingMacro then
+                for _, g in ipairs(GroupActions(EditingMacro)) do Expanded[g.key] = open end
+                RebuildActions()
+            end
         end
 
         local function RefreshPicker()
@@ -1669,6 +2211,9 @@ if IsInMatch() then
             end
         end)
 
+        ExpandBtn.MouseButton1Click:Connect(function() SetAllExpanded(true) end)
+        CollapseBtn.MouseButton1Click:Connect(function() SetAllExpanded(false) end)
+
         table.insert(MacroListeners, RefreshPicker)
         RefreshPicker()
         Log("info", "Editor tab built")
@@ -1676,6 +2221,7 @@ if IsInMatch() then
 
     -- Resume any toggles that were saved as on, now that everything above is set up
     if MatchConfig.AutoCollectItems then StartAutoCollect() end
+    if MatchConfig.AutoUpgrade then StartAutoUpgrade() end
     if MatchConfig.AutoReplay then StartAutoReplay() end
     if MatchConfig.AutoPlayMacro then StartAutoPlayMacro() end
     print("[TDR] Match tab built.")
