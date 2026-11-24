@@ -66,18 +66,11 @@ print("[TDR] DARK Lib loaded.")
 local Lib = Dark.CreateLib()
 print("[TDR] Lib window created.")
 
--- ── Logger: buffers entries; the Log tab (built at the end) shows them live ─
-local MAX_LOG_LINES = 300
-local LogEntries = {}
-local LogSink = nil              -- set by the Log tab once it exists
-local LogGameRemotes = true      -- Log tab toggle: show remotes the game/player fires
+-- ── Logger: prints to the executor console ──────────────────────────────
+local LogGameRemotes = false     -- set true to also print every remote the game/player fires
 
 local function Log(level, text)
-    local entry = {level = level, text = text, time = os.date("%H:%M:%S")}
-    table.insert(LogEntries, entry)
-    if #LogEntries > MAX_LOG_LINES then table.remove(LogEntries, 1) end
     print(string.format("[TDR][%s] %s", level, text))
-    if LogSink then pcall(LogSink, entry) end
 end
 
 -- Same as GetFullName() but built from .Parent only, so it's safe inside a __namecall hook
@@ -112,6 +105,75 @@ local function DescribeArgs(args, n)
     local out = {}
     for i = 1, (n or #args) do out[i] = Describe(args[i]) end
     return table.concat(out, ", ")
+end
+
+-- ── Little notification in the middle of the screen (one at a time) ─────────
+local NotifyGui = nil
+local NotifyToken = 0
+
+local function Notify(title, text, seconds)
+    if not NotifyGui or not NotifyGui.Parent then
+        NotifyGui = Instance.new("ScreenGui")
+        NotifyGui.Name = "TDRNotify"
+        NotifyGui.ResetOnSpawn = false
+        NotifyGui.DisplayOrder = 998
+        local ok = pcall(function() NotifyGui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+        if not ok or not NotifyGui.Parent then NotifyGui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+    end
+
+    NotifyToken = NotifyToken + 1
+    local token = NotifyToken
+    for _, child in ipairs(NotifyGui:GetChildren()) do child:Destroy() end
+
+    -- no background: just outlined text, bottom centre, 50px up
+    local frame = Instance.new("Frame", NotifyGui)
+    frame.AnchorPoint = Vector2.new(0.5, 1)
+    frame.Position = UDim2.new(0.5, 0, 1, -50)
+    frame.Size = UDim2.new(0, 200, 0, 34)
+    frame.BackgroundTransparency = 1
+
+    local top = Instance.new("TextLabel", frame)
+    top.Size = UDim2.new(1, 0, 0, 12)
+    top.BackgroundTransparency = 1
+    top.Text = title
+    top.TextColor3 = Color3.fromRGB(190, 190, 198)
+    top.TextSize = 10
+    top.Font = Enum.Font.GothamMedium
+    top.TextStrokeColor3 = Color3.new(0, 0, 0)
+    top.TextTransparency = 1
+    top.TextStrokeTransparency = 1
+
+    local main = Instance.new("TextLabel", frame)
+    main.Size = UDim2.new(1, -8, 0, 20)
+    main.Position = UDim2.new(0, 4, 0, 13)
+    main.BackgroundTransparency = 1
+    main.Text = text
+    main.TextColor3 = Color3.fromRGB(240, 240, 245)
+    main.Font = Enum.Font.GothamBold
+    main.TextScaled = true
+    main.TextStrokeColor3 = Color3.new(0, 0, 0)
+    main.TextTransparency = 1
+    main.TextStrokeTransparency = 1
+    local cap = Instance.new("UITextSizeConstraint", main)
+    cap.MaxTextSize = 15
+
+    local function fade(visible, duration)
+        local info = TweenInfo.new(duration)
+        for _, label in ipairs({top, main}) do
+            TweenService:Create(label, info, {
+                TextTransparency = visible and 0 or 1,
+                TextStrokeTransparency = visible and 0.35 or 1,
+            }):Play()
+        end
+    end
+
+    fade(true, 0.15)
+    task.delay(seconds or 2.5, function()
+        if token ~= NotifyToken or not frame.Parent then return end
+        fade(false, 0.4)
+        task.wait(0.45)
+        if frame.Parent then frame:Destroy() end
+    end)
 end
 
 -- ── Config (save/load so Auto Queue survives auto-execute reloads) ─────
@@ -278,11 +340,14 @@ if IsInMatch() then
         AutoReplay        = false,
         AutoCollectItems  = false,
         AutoUpgrade       = false,
+        AutoFish          = false,
+        FishMode          = "Cast + catch",
         CollectMode       = "TouchInterest",
         AutoPlayMacro     = false,
         SelectedMacroName = nil,
     }
     local COLLECT_MODES = {"TouchInterest", "Teleport", "MoveTo"}
+    local FISH_MODES    = {"Cast + catch", "Catch only"}
 
     local function LoadMatchConfig()
         local ok, result = pcall(function()
@@ -311,12 +376,16 @@ if IsInMatch() then
     if not table.find(COLLECT_MODES, MatchConfig.CollectMode) then
         MatchConfig.CollectMode = "TouchInterest"
     end
+    if not table.find(FISH_MODES, MatchConfig.FishMode) then
+        MatchConfig.FishMode = "Cast + catch"
+    end
 
     -- Forward-declared so earlier UI closures can call later definitions
     local Macros = {}
     local SelectedMacro, SelectedRow = nil, nil
     local RemotesByLabel = {}
     local TargetRemotes = {}          -- [remote instance] = label (filled by the remote scan)
+    local FishArgs = nil              -- args of the last General.Fish cast you made by hand
     local Playing = false             -- true while a macro is running (blocks overlapping runs)
     local HookInstalled = false
     local SelfCalls = 0               -- lets the remote spy skip calls this script makes itself
@@ -339,7 +408,7 @@ if IsInMatch() then
         if HookInstalled and TargetRemotes[remote] then
             SelfCalls = SelfCalls + 1 -- the hook consumes this synchronously
         end
-        local ok, res = pcall(function()
+        local ok, res, extra = pcall(function()
             if remote:IsA("RemoteFunction") then
                 return remote:InvokeServer(table.unpack(args, 1, args.n))
             else
@@ -347,7 +416,7 @@ if IsInMatch() then
             end
         end)
         SelfCalls = 0 -- anything unconsumed means the call never reached the hook
-        return ok, res
+        return ok, res, extra
     end
 
     -- ── Mana: PlayerGui.Main.Mana.Value (NumberValue) ─────────────────────
@@ -703,10 +772,17 @@ if IsInMatch() then
     RightHeader.Font = Enum.Font.GothamBold
     RightHeader.TextXAlignment = Enum.TextXAlignment.Left
 
-    local TogglesHolder = Instance.new("Frame", RightBox)
+    local TogglesHolder = Instance.new("ScrollingFrame", RightBox)
     TogglesHolder.Size = UDim2.new(1, -12, 1, -38)
     TogglesHolder.Position = UDim2.new(0, 6, 0, 32)
     TogglesHolder.BackgroundTransparency = 1
+    TogglesHolder.BorderSizePixel = 0
+    TogglesHolder.ScrollBarThickness = 3
+    TogglesHolder.CanvasSize = UDim2.new(0, 0, 0, 0)
+    TogglesHolder.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    TogglesHolder.ClipsDescendants = true
+    local TogglesPad = Instance.new("UIPadding", TogglesHolder)
+    TogglesPad.PaddingRight = UDim.new(0, 6) -- keep rows clear of the scrollbar
 
     local TogglesLayout = Instance.new("UIListLayout", TogglesHolder)
     TogglesLayout.Padding = UDim.new(0, 6)
@@ -776,6 +852,7 @@ if IsInMatch() then
     --   Teleport       hop onto each drop, then back to where you were
     --   MoveTo         walk to the nearest drop (skips ones just visited / unreachable)
     local AutoCollectRunning = false
+    local TELEPORT_DWELL = 0.2 -- seconds spent on each drop before moving on / teleporting back
 
     local function GetCollectTargets()
         local targets = {}
@@ -834,7 +911,7 @@ if IsInMatch() then
                             if not MatchConfig.AutoCollectItems or not hrp.Parent then break end
                             if part.Parent then
                                 hrp.CFrame = part.CFrame
-                                task.wait(0.05) -- give the touch a physics step to register
+                                task.wait(TELEPORT_DWELL) -- let the touch register before leaving
                             end
                         end
                         if hrp.Parent then
@@ -899,7 +976,7 @@ if IsInMatch() then
         else
             Log("error", "<< " .. label .. " error: " .. tostring(res))
         end
-        return ok
+        return ok, res
     end
 
     -- ── Auto-Replay: wait for the Rewards menu to be visible, then wait 3s
@@ -1081,6 +1158,108 @@ if IsInMatch() then
         end)
     end
 
+    -- ── Auto-Fish (built from the fishing probe log) ────────────────────────────
+    --   cast   General.Fish:InvokeServer(<point on workspace.Map.Lake.Cover>, Color3(0, 0.0667, 1))
+    --          It YIELDS until a fish is on the line, then returns (fishName, {Rod, Bait, ...}).
+    --          If you cast by hand once, those exact args are remembered and reused.
+    --   catch  General.CatchFish:InvokeServer(), then a notification shows the fish name.
+    -- "Cast + catch" runs the whole loop. "Catch only": you cast by hand, and when the
+    -- game's own Fish call returns (a fish is on the line) this reels it in for you.
+    local FISH_COLOR = Color3.new(0, 0.0666667, 1)
+    local AutoFishRunning = false
+    local Reeling = false
+
+    -- A point on the lake surface near you, a few studs in from the shore
+    local function PickCastPoint()
+        local map = Workspace:FindFirstChild("Map")
+        local lake = map and map:FindFirstChild("Lake")
+        local cover = lake and lake:FindFirstChild("Cover")
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if not (cover and hrp) then return nil end
+
+        local localPos = cover.CFrame:PointToObjectSpace(hrp.Position)
+        local hx, hz = cover.Size.X / 2 - 3, cover.Size.Z / 2 - 3
+        local x = math.clamp(localPos.X, -hx, hx)
+        local z = math.clamp(localPos.Z, -hz, hz)
+        local inward = Vector3.new(-x, 0, -z) -- toward the middle of the lake
+        if inward.Magnitude > 0.1 then
+            local step = inward.Unit * math.min(5, inward.Magnitude)
+            x, z = x + step.X, z + step.Z
+        end
+        return cover.CFrame:PointToWorldSpace(Vector3.new(x, cover.Size.Y / 2, z))
+    end
+
+    -- A fish is on the line: reel it in and show what it was
+    local function ReelIn(fishName)
+        if Reeling then return end
+        Reeling = true
+        task.wait(0.15)
+        local ok, res = FireRemoteByLabel("General.CatchFish")
+        local name = tostring(fishName)
+        if ok and res ~= false then
+            Log("ok", "Auto-Fish: caught " .. name)
+            Notify("Caught", name, 3)
+        else
+            Log("warn", "Auto-Fish: CatchFish failed for " .. name .. " (" .. tostring(res) .. ")")
+            Notify("Got away", name, 3)
+        end
+        Reeling = false
+    end
+
+    local function StartAutoFish()
+        if AutoFishRunning then return end
+        AutoFishRunning = true
+        task.spawn(function()
+            local fails = 0
+            local warnedHook = false
+
+            while MatchConfig.AutoFish do
+                if MatchConfig.FishMode == "Catch only" then
+                    if not HookInstalled and not warnedHook then
+                        warnedHook = true
+                        Log("warn", "Auto-Fish (Catch only) needs the remote hook, which isn't installed")
+                    end
+                    task.wait(0.5) -- the remote hook reels in when your own cast returns
+
+                else
+                    local remote = RemotesByLabel["General.Fish"]
+                    local args = FishArgs
+                    if not args then
+                        local point = PickCastPoint()
+                        if point then args = table.pack(point, FISH_COLOR) end
+                    end
+
+                    if not remote then
+                        Log("error", "Auto-Fish: remote General.Fish not found")
+                        task.wait(3)
+                    elseif not args then
+                        Log("error", "Auto-Fish: workspace.Map.Lake.Cover or your character wasn't found")
+                        task.wait(3)
+                    else
+                        Log("send", ">> General.Fish(" .. DescribeArgs(args, args.n) .. ")  [waits until a fish is on the line]")
+                        local t0 = tick()
+                        local ok, name = CallRemote(remote, table.unpack(args, 1, args.n))
+                        if not MatchConfig.AutoFish then break end -- turned off while waiting
+
+                        if ok and type(name) == "string" then
+                            fails = 0
+                            Log("ok", string.format("<< General.Fish: %s on the line after %.1fs", name, tick() - t0))
+                            ReelIn(name)
+                            task.wait(1.5) -- let the rod reset before the next cast
+                        else
+                            fails = fails + 1
+                            Log("warn", string.format("<< General.Fish gave no fish (%s), %d in a row",
+                                ok and Describe(name) or tostring(name), fails))
+                            task.wait(math.min(2 + fails, 10))
+                        end
+                    end
+                end
+            end
+            AutoFishRunning = false
+        end)
+    end
+
     MakeCustomToggle(TogglesHolder, "Auto-Replay", MatchConfig.AutoReplay, function(state)
         MatchConfig.AutoReplay = state
         SaveMatchConfig()
@@ -1150,6 +1329,19 @@ if IsInMatch() then
         SaveMatchConfig()
         Log("info", "Auto-Upgrade " .. (state and "ON" or "OFF"))
         if state then StartAutoUpgrade() end
+    end)
+
+    MakeCustomToggle(TogglesHolder, "Auto-Fish", MatchConfig.AutoFish, function(state)
+        MatchConfig.AutoFish = state
+        SaveMatchConfig()
+        Log("info", "Auto-Fish " .. (state and "ON" or "OFF"))
+        if state then StartAutoFish() end
+    end)
+
+    MakeModeRow(TogglesHolder, "Fish", FISH_MODES, MatchConfig.FishMode, function(mode)
+        MatchConfig.FishMode = mode
+        SaveMatchConfig()
+        Log("info", "Fish mode: " .. mode)
     end)
 
     -- ── Macro persistence (CFrame/Vector3 aren't JSON-safe, so wrap them) ─
@@ -1376,7 +1568,7 @@ if IsInMatch() then
     -- ── Playback: replays each recorded remote call at its recorded offset ─
     -- Every call runs in its own thread so one InvokeServer the server never
     -- answers can't stall the rest of the timeline, and every send / return /
-    -- error / missing remote goes to the Log tab. Only one macro runs at a time.
+    -- error / missing remote is printed to the console. Only one macro runs at a time.
     RunMacro = function(macro)
         if Playing then
             Log("warn", "Already playing a macro, ignoring '" .. macro.Name .. "'")
@@ -1588,9 +1780,12 @@ if IsInMatch() then
 
     -- Every client->server call lands here, from both hook layers
     local function HandleRemoteCall(self, method, ...)
+        local label = TargetRemotes[self]
+        if label == "General.Fish" and SelfCalls == 0 then
+            FishArgs = table.pack(...) -- learn exactly how the game casts; Auto-Fish reuses it
+        end
         if SelfCalls == 0 and not Recording and not LogGameRemotes then return end
 
-        local label = TargetRemotes[self]
         if not label then
             if not Recording then return end
             label = TrackUnknownRemote(self)
@@ -1651,9 +1846,23 @@ if IsInMatch() then
         OldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
             local method = getnamecallmethod()
             if method == "InvokeServer" or method == "FireServer" then
+                local own = SelfCalls > 0 -- a call this script is making (HandleRemoteCall consumes the flag)
                 local ok, err = pcall(HandleRemoteCall, self, method, ...)
                 if not ok then task.defer(Log, "error", "Remote hook error: " .. tostring(err)) end
                 if setnamecallmethod then setnamecallmethod(method) end -- nested namecalls can overwrite it
+
+                -- Catch only: the game's own Fish call returning means a fish is on the line
+                if method == "InvokeServer" and not own and TargetRemotes[self] == "General.Fish" then
+                    local result = table.pack(OldNamecall(self, ...))
+                    if MatchConfig.AutoFish and MatchConfig.FishMode == "Catch only"
+                        and type(result[1]) == "string" then
+                        task.defer(function()
+                            Log("ok", "Auto-Fish: fish on the line: " .. result[1])
+                            ReelIn(result[1])
+                        end)
+                    end
+                    return table.unpack(result, 1, result.n)
+                end
             end
             return OldNamecall(self, ...)
         end))
@@ -2222,141 +2431,8 @@ if IsInMatch() then
     -- Resume any toggles that were saved as on, now that everything above is set up
     if MatchConfig.AutoCollectItems then StartAutoCollect() end
     if MatchConfig.AutoUpgrade then StartAutoUpgrade() end
+    if MatchConfig.AutoFish then StartAutoFish() end
     if MatchConfig.AutoReplay then StartAutoReplay() end
     if MatchConfig.AutoPlayMacro then StartAutoPlayMacro() end
     print("[TDR] Match tab built.")
-end
-
--- ═════════════════════════════════════════════════════════════════════
--- LOG TAB — live view of what the script sends, receives and decides.
--- Entries logged before this tab exists are buffered and flushed here.
--- ═════════════════════════════════════════════════════════════════════
-do
-    local LOG_COLORS = {
-        info  = Color3.fromRGB(170, 170, 175),
-        send  = Color3.fromRGB(110, 170, 255),
-        ok    = Color3.fromRGB(100, 200, 130),
-        warn  = Color3.fromRGB(230, 190, 80),
-        error = Color3.fromRGB(235, 95, 95),
-    }
-
-    local Tab = Lib:AddTab("Log", "full")
-    local Root = Tab.Content
-    AddPadding(Root, 4)
-
-    local Box = Instance.new("Frame", Root)
-    Box.Size = UDim2.new(1, 0, 1, 0)
-    Box.BackgroundColor3 = Color3.fromRGB(20, 20, 23)
-    Box.BackgroundTransparency = 0.3
-    Instance.new("UICorner", Box).CornerRadius = UDim.new(0, 10)
-
-    local Title = Instance.new("TextLabel", Box)
-    Title.Size = UDim2.new(0, 60, 0, 22)
-    Title.Position = UDim2.new(0, 10, 0, 6)
-    Title.BackgroundTransparency = 1
-    Title.Text = "Log"
-    Title.TextColor3 = Color3.fromRGB(230, 230, 230)
-    Title.TextSize = 13
-    Title.Font = Enum.Font.GothamBold
-    Title.TextXAlignment = Enum.TextXAlignment.Left
-
-    local function MakeBarButton(text, rightOffset, width)
-        local b = Instance.new("TextButton", Box)
-        b.Size = UDim2.new(0, width, 0, 22)
-        b.AnchorPoint = Vector2.new(1, 0)
-        b.Position = UDim2.new(1, -rightOffset, 0, 6)
-        b.BackgroundColor3 = Color3.fromRGB(55, 55, 60)
-        b.Text = text
-        b.TextColor3 = Color3.fromRGB(230, 230, 230)
-        b.TextSize = 11
-        b.Font = Enum.Font.GothamMedium
-        b.AutoButtonColor = false
-        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
-        return b
-    end
-
-    local ClearBtn = MakeBarButton("Clear", 8, 50)
-    local CopyBtn  = MakeBarButton("Copy", 64, 50)
-    local SpyBtn   = MakeBarButton("Spy: ON", 120, 70)
-
-    local List = Instance.new("ScrollingFrame", Box)
-    List.Size = UDim2.new(1, -12, 1, -40)
-    List.Position = UDim2.new(0, 6, 0, 34)
-    List.BackgroundTransparency = 1
-    List.BorderSizePixel = 0
-    List.ScrollBarThickness = 4
-    List.CanvasSize = UDim2.new(0, 0, 0, 0)
-    List.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    List.ClipsDescendants = true
-
-    local ListLayout = Instance.new("UIListLayout", List)
-    ListLayout.Padding = UDim.new(0, 2)
-    ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
-
-    local Rows = {}
-    local rowOrder = 0
-
-    local function AddRow(entry)
-        local nearBottom = List.CanvasPosition.Y + List.AbsoluteWindowSize.Y >= List.AbsoluteCanvasSize.Y - 24
-        rowOrder = rowOrder + 1
-
-        local row = Instance.new("TextLabel", List)
-        row.Size = UDim2.new(1, -6, 0, 0)
-        row.AutomaticSize = Enum.AutomaticSize.Y
-        row.BackgroundTransparency = 1
-        row.LayoutOrder = rowOrder
-        row.Font = Enum.Font.Code
-        row.TextSize = 11
-        row.TextWrapped = true
-        row.TextXAlignment = Enum.TextXAlignment.Left
-        row.TextYAlignment = Enum.TextYAlignment.Top
-        row.TextColor3 = LOG_COLORS[entry.level] or LOG_COLORS.info
-        row.Text = string.format("[%s] %s", entry.time, entry.text)
-
-        table.insert(Rows, row)
-        if #Rows > MAX_LOG_LINES then
-            table.remove(Rows, 1):Destroy()
-        end
-
-        if nearBottom then -- only follow the tail if you were already at the bottom
-            task.delay(0.03, function()
-                List.CanvasPosition = Vector2.new(0, math.max(0, List.AbsoluteCanvasSize.Y - List.AbsoluteWindowSize.Y))
-            end)
-        end
-    end
-
-    ClearBtn.MouseButton1Click:Connect(function()
-        for _, r in ipairs(Rows) do r:Destroy() end
-        table.clear(Rows)
-        table.clear(LogEntries)
-    end)
-
-    CopyBtn.MouseButton1Click:Connect(function()
-        local lines = {}
-        for _, e in ipairs(LogEntries) do
-            lines[#lines + 1] = string.format("[%s][%s] %s", e.time, e.level, e.text)
-        end
-        local clip = setclipboard or toclipboard
-        if clip then
-            clip(table.concat(lines, "\n"))
-            Log("ok", "Copied " .. #lines .. " log lines to the clipboard")
-        else
-            Log("warn", "This executor has no clipboard function")
-        end
-    end)
-
-    local function RefreshSpyButton()
-        SpyBtn.Text = LogGameRemotes and "Spy: ON" or "Spy: OFF"
-        SpyBtn.BackgroundColor3 = LogGameRemotes and Color3.fromRGB(60, 110, 170) or Color3.fromRGB(55, 55, 60)
-    end
-    RefreshSpyButton()
-
-    SpyBtn.MouseButton1Click:Connect(function()
-        LogGameRemotes = not LogGameRemotes
-        RefreshSpyButton()
-    end)
-
-    for _, entry in ipairs(LogEntries) do AddRow(entry) end
-    LogSink = AddRow
-    print("[TDR] Log tab built.")
 end
