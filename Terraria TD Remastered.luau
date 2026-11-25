@@ -342,12 +342,26 @@ if IsInMatch() then
         AutoUpgrade       = false,
         AutoFish          = false,
         FishMode          = "Cast + catch",
+        Delays            = {},
         CollectMode       = "TouchInterest",
         AutoPlayMacro     = false,
         SelectedMacroName = nil,
     }
     local COLLECT_MODES = {"TouchInterest", "Teleport", "MoveTo"}
     local FISH_MODES    = {"Cast + catch", "Catch only"}
+
+    -- Delays the automations use, in seconds; adjustable in the Settings tab
+    local DELAY_SETTINGS = {
+        {key = "TeleportDwell",   label = "Teleport collect: time on each drop",   default = 0.2,  min = 0.02, max = 2},
+        {key = "TeleportReturn",  label = "Teleport collect: pause after returning", default = 0.25, min = 0,    max = 3},
+        {key = "MoveToTimeout",   label = "MoveTo collect: give up on a drop after", default = 4,    min = 1,    max = 15},
+        {key = "MoveToRevisit",   label = "MoveTo collect: skip a visited drop for", default = 5,    min = 0,    max = 30},
+        {key = "ReplayDelay",     label = "Auto-Replay: wait before replaying",     default = 3,    min = 0,    max = 15},
+        {key = "UpgradeCooldown", label = "Auto-Upgrade: retry a failed upgrade after", default = 3, min = 0,    max = 15},
+        {key = "UpgradePoll",     label = "Auto-Upgrade: check mana every",         default = 0.2,  min = 0.05, max = 2},
+        {key = "FishCatchDelay",  label = "Auto-Fish: wait before reeling in",      default = 0.15, min = 0,    max = 2},
+        {key = "FishRecastDelay", label = "Auto-Fish: wait before the next cast",   default = 1.5,  min = 0,    max = 10},
+    }
 
     local function LoadMatchConfig()
         local ok, result = pcall(function()
@@ -379,6 +393,12 @@ if IsInMatch() then
     if not table.find(FISH_MODES, MatchConfig.FishMode) then
         MatchConfig.FishMode = "Cast + catch"
     end
+    if type(MatchConfig.Delays) ~= "table" then MatchConfig.Delays = {} end
+    for _, def in ipairs(DELAY_SETTINGS) do
+        local v = MatchConfig.Delays[def.key]
+        if type(v) ~= "number" then v = def.default end
+        MatchConfig.Delays[def.key] = math.clamp(v, def.min, def.max)
+    end
 
     -- Forward-declared so earlier UI closures can call later definitions
     local Macros = {}
@@ -390,6 +410,10 @@ if IsInMatch() then
     local HookInstalled = false
     local SelfCalls = 0               -- lets the remote spy skip calls this script makes itself
     local PlayMacro, RunMacro, AddMacroListEntry, SaveMacros, LoadMacros
+    local StopPlayback                -- cancels the macro that is playing
+    local PlayToken = 0               -- bumped to cancel a playback
+    local SetAutoReplay, SetAutoPlayMacro, SetAutoUpgrade -- flip those toggles from code
+    local _unused
 
     local MacroLabels = {}            -- [macro] = its label in the Macros list
     local MacroListeners = {}         -- called when macros are added / renamed / deleted
@@ -428,7 +452,7 @@ if IsInMatch() then
     end
 
     -- Blocks until mana >= cost (60s cap). Never blocks if the value isn't found.
-    local function WaitForMana(cost, tag)
+    local function WaitForMana(cost, tag, cancelled)
         local v = GetManaValue()
         if not v then
             Log("warn", "Mana value not found (PlayerGui.Main.Mana.Value), not waiting")
@@ -438,7 +462,8 @@ if IsInMatch() then
 
         local t0 = tick()
         Log("info", string.format("%s waiting for mana: %.0f/%.0f", tag, v.Value, cost))
-        while v.Value < cost and tick() - t0 < 60 do task.wait(0.1) end
+        while v.Value < cost and tick() - t0 < 60 and not (cancelled and cancelled()) do task.wait(0.1) end
+        if cancelled and cancelled() then return false end
         if v.Value >= cost then
             Log("ok", string.format("%s mana ready after %.1fs (%.0f)", tag, tick() - t0, v.Value))
             return true
@@ -832,17 +857,23 @@ if IsInMatch() then
             track.BackgroundColor3 = Color3.fromRGB(100, 180, 255)
         end
 
-        hit.MouseButton1Click:Connect(function()
-            state = not state
+        local function apply(newState)
+            state = newState
             local knobX = state and (trackW - (trackH - 6) - 3) or 3
             TweenService:Create(knob, TWEEN_MEDIUM, {Position = UDim2.new(0, knobX, 0.5, 0)}):Play()
             TweenService:Create(track, TWEEN_MEDIUM, {
                 BackgroundColor3 = state and Color3.fromRGB(100, 180, 255) or Color3.fromRGB(55, 55, 60)
             }):Play()
             if callback then callback(state) end
-        end)
+        end
 
-        return row
+        hit.MouseButton1Click:Connect(function() apply(not state) end)
+
+        -- second return: lets other buttons (Stop all, the quick-stop pop-up) flip this
+        -- toggle exactly like a tap would, including saving and stopping its loop
+        return row, function(value)
+            if value ~= state then apply(value) end
+        end
     end
 
     -- ── Auto-Collect Items: touch every part under workspace.Drops that
@@ -852,7 +883,6 @@ if IsInMatch() then
     --   Teleport       hop onto each drop, then back to where you were
     --   MoveTo         walk to the nearest drop (skips ones just visited / unreachable)
     local AutoCollectRunning = false
-    local TELEPORT_DWELL = 0.2 -- seconds spent on each drop before moving on / teleporting back
 
     local function GetCollectTargets()
         local targets = {}
@@ -911,14 +941,14 @@ if IsInMatch() then
                             if not MatchConfig.AutoCollectItems or not hrp.Parent then break end
                             if part.Parent then
                                 hrp.CFrame = part.CFrame
-                                task.wait(TELEPORT_DWELL) -- let the touch register before leaving
+                                task.wait(MatchConfig.Delays.TeleportDwell) -- let the touch register before leaving
                             end
                         end
                         if hrp.Parent then
                             hrp.CFrame = home
                             hrp.AssemblyLinearVelocity = Vector3.zero
                         end
-                        task.wait(0.25)
+                        task.wait(MatchConfig.Delays.TeleportReturn)
                     end
 
                 elseif mode == "MoveTo" then
@@ -926,7 +956,7 @@ if IsInMatch() then
                     local best, bestDist = nil, math.huge
                     for _, part in ipairs(GetCollectTargets()) do
                         local seen = visited[part]
-                        if not (seen and now - seen < 5) then
+                        if not (seen and now - seen < MatchConfig.Delays.MoveToRevisit) then
                             local d = (part.Position - hrp.Position).Magnitude
                             if d < bestDist then best, bestDist = part, d end
                         end
@@ -939,7 +969,7 @@ if IsInMatch() then
                             and MatchConfig.CollectMode == "MoveTo"
                             and best.Parent
                             and hrp.Parent
-                            and tick() - t0 < 4
+                            and tick() - t0 < MatchConfig.Delays.MoveToTimeout
                             and (hrp.Position - best.Position).Magnitude > 3 do
                             task.wait(0.1)
                         end
@@ -1004,8 +1034,9 @@ if IsInMatch() then
                         end
                     end
                     if MatchConfig.AutoReplay and rewards.Visible then
-                        Log("info", "Auto-Replay: Rewards visible, replaying in 3s")
-                        task.wait(3)
+                        local delay = MatchConfig.Delays.ReplayDelay
+                        Log("info", string.format("Auto-Replay: Rewards visible, replaying in %gs", delay))
+                        task.wait(delay)
                         if MatchConfig.AutoReplay then
                             FireRemoteByLabel("General.ReplayMatch")
                         end
@@ -1144,10 +1175,10 @@ if IsInMatch() then
 
                             Safe(ConfirmAction, {remote = "UI.UpgradeTower", args = {id}}, snap, tag)
                             if (unit:GetAttribute("Upgrade") or 0) <= level then
-                                failUntil[unit] = tick() + 3 -- didn't apply: leave it alone briefly
+                                failUntil[unit] = tick() + MatchConfig.Delays.UpgradeCooldown -- didn't apply: leave it alone briefly
                             end
                         elseif unit then
-                            task.wait(0.2) -- saving up for it
+                            task.wait(MatchConfig.Delays.UpgradePoll) -- saving up for it
                         else
                             task.wait(0.5) -- nothing upgradable right now
                         end
@@ -1194,7 +1225,7 @@ if IsInMatch() then
     local function ReelIn(fishName)
         if Reeling then return end
         Reeling = true
-        task.wait(0.15)
+        task.wait(MatchConfig.Delays.FishCatchDelay)
         local ok, res = FireRemoteByLabel("General.CatchFish")
         local name = tostring(fishName)
         if ok and res ~= false then
@@ -1246,7 +1277,7 @@ if IsInMatch() then
                             fails = 0
                             Log("ok", string.format("<< General.Fish: %s on the line after %.1fs", name, tick() - t0))
                             ReelIn(name)
-                            task.wait(1.5) -- let the rod reset before the next cast
+                            task.wait(MatchConfig.Delays.FishRecastDelay) -- let the rod reset before the next cast
                         else
                             fails = fails + 1
                             Log("warn", string.format("<< General.Fish gave no fish (%s), %d in a row",
@@ -1260,14 +1291,14 @@ if IsInMatch() then
         end)
     end
 
-    MakeCustomToggle(TogglesHolder, "Auto-Replay", MatchConfig.AutoReplay, function(state)
+    _unused, SetAutoReplay = MakeCustomToggle(TogglesHolder, "Auto-Replay", MatchConfig.AutoReplay, function(state)
         MatchConfig.AutoReplay = state
         SaveMatchConfig()
         Log("info", "Auto-Replay " .. (state and "ON" or "OFF"))
         if state then StartAutoReplay() end
     end)
 
-    MakeCustomToggle(TogglesHolder, "Auto-Play Macro", MatchConfig.AutoPlayMacro, function(state)
+    _unused, SetAutoPlayMacro = MakeCustomToggle(TogglesHolder, "Auto-Play Macro", MatchConfig.AutoPlayMacro, function(state)
         MatchConfig.AutoPlayMacro = state
         SaveMatchConfig()
         Log("info", "Auto-Play Macro " .. (state and "ON" or "OFF"))
@@ -1324,7 +1355,7 @@ if IsInMatch() then
         SaveMatchConfig()
     end)
 
-    MakeCustomToggle(TogglesHolder, "Auto-Upgrade", MatchConfig.AutoUpgrade, function(state)
+    _unused, SetAutoUpgrade = MakeCustomToggle(TogglesHolder, "Auto-Upgrade", MatchConfig.AutoUpgrade, function(state)
         MatchConfig.AutoUpgrade = state
         SaveMatchConfig()
         Log("info", "Auto-Upgrade " .. (state and "ON" or "OFF"))
@@ -1342,6 +1373,112 @@ if IsInMatch() then
         MatchConfig.FishMode = mode
         SaveMatchConfig()
         Log("info", "Fish mode: " .. mode)
+    end)
+
+    -- Stops every macro-style automation: Auto-Replay, Auto-Play Macro (and the macro
+    -- that's playing right now) and Auto-Upgrade. Collect and Fish are left alone.
+    local function StopAllMacros()
+        if SetAutoReplay then SetAutoReplay(false) end
+        if SetAutoPlayMacro then SetAutoPlayMacro(false) end
+        if SetAutoUpgrade then SetAutoUpgrade(false) end
+        StopPlayback()
+        Log("info", "Stopped Auto-Replay, Auto-Play Macro and Auto-Upgrade")
+    end
+
+    local StopAllBtn = Instance.new("TextButton", RightBox)
+    StopAllBtn.Size = UDim2.new(0, 62, 0, 20)
+    StopAllBtn.AnchorPoint = Vector2.new(1, 0)
+    StopAllBtn.Position = UDim2.new(1, -8, 0, 7)
+    StopAllBtn.BackgroundColor3 = Color3.fromRGB(170, 55, 55)
+    StopAllBtn.Text = "Stop all"
+    StopAllBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    StopAllBtn.TextSize = 11
+    StopAllBtn.Font = Enum.Font.GothamBold
+    StopAllBtn.AutoButtonColor = false
+    Instance.new("UICorner", StopAllBtn).CornerRadius = UDim.new(0, 6)
+    StopAllBtn.Activated:Connect(StopAllMacros)
+
+    -- Small pop-up at the middle of the right edge. It only shows while something it can
+    -- stop is running, so it stays out of the way (drag it if it's in the way).
+    local PopupGui = Instance.new("ScreenGui")
+    PopupGui.Name = "TDRQuickStop"
+    PopupGui.ResetOnSpawn = false
+    PopupGui.DisplayOrder = 997
+    local okPopup = pcall(function() PopupGui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+    if not okPopup or not PopupGui.Parent then PopupGui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+
+    local Popup = Instance.new("Frame", PopupGui)
+    Popup.AnchorPoint = Vector2.new(1, 0.5)
+    Popup.Position = UDim2.new(1, -8, 0.5, 0)
+    Popup.Size = UDim2.new(0, 136, 0, 0)
+    Popup.AutomaticSize = Enum.AutomaticSize.Y
+    Popup.BackgroundColor3 = Color3.fromRGB(20, 20, 23)
+    Popup.BackgroundTransparency = 0.2
+    Popup.Visible = false
+    Popup.Active = true
+    Popup.Draggable = true
+    Instance.new("UICorner", Popup).CornerRadius = UDim.new(0, 8)
+    AddPadding(Popup, 5)
+    local PopupLayout = Instance.new("UIListLayout", Popup)
+    PopupLayout.Padding = UDim.new(0, 4)
+    PopupLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+    local function MakePopupRow(order, onStop)
+        local row = Instance.new("Frame", Popup)
+        row.Size = UDim2.new(1, 0, 0, 26)
+        row.LayoutOrder = order
+        row.BackgroundTransparency = 1
+        row.Visible = false
+
+        local label = Instance.new("TextLabel", row)
+        label.Size = UDim2.new(1, -48, 1, 0)
+        label.BackgroundTransparency = 1
+        label.TextColor3 = Color3.fromRGB(230, 230, 230)
+        label.TextSize = 11
+        label.Font = Enum.Font.GothamMedium
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.TextTruncate = Enum.TextTruncate.AtEnd
+
+        local btn = Instance.new("TextButton", row)
+        btn.Size = UDim2.new(0, 44, 0, 22)
+        btn.AnchorPoint = Vector2.new(1, 0.5)
+        btn.Position = UDim2.new(1, 0, 0.5, 0)
+        btn.BackgroundColor3 = Color3.fromRGB(170, 55, 55)
+        btn.Text = "Stop"
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.TextSize = 11
+        btn.Font = Enum.Font.GothamBold
+        btn.AutoButtonColor = false
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+        btn.Activated:Connect(onStop)
+        return row, label
+    end
+
+    local ReplayRow, ReplayLabel = MakePopupRow(1, function()
+        if SetAutoReplay then SetAutoReplay(false) end
+    end)
+    local MacroRow, MacroLabel = MakePopupRow(2, function()
+        if SetAutoPlayMacro then SetAutoPlayMacro(false) end
+        StopPlayback()
+    end)
+    local UpgradeRow, UpgradeLabel = MakePopupRow(3, function()
+        if SetAutoUpgrade then SetAutoUpgrade(false) end
+    end)
+    ReplayLabel.Text = "Auto-Replay"
+    UpgradeLabel.Text = "Auto-Upgrade"
+
+    task.spawn(function()
+        while PopupGui.Parent do
+            local replay  = MatchConfig.AutoReplay
+            local macro   = MatchConfig.AutoPlayMacro or Playing
+            local upgrade = MatchConfig.AutoUpgrade
+            ReplayRow.Visible = replay
+            MacroRow.Visible = macro
+            UpgradeRow.Visible = upgrade
+            MacroLabel.Text = Playing and "Macro (playing)" or "Auto-Play Macro"
+            Popup.Visible = replay or macro or upgrade
+            task.wait(0.25)
+        end
     end)
 
     -- ── Macro persistence (CFrame/Vector3 aren't JSON-safe, so wrap them) ─
@@ -1575,6 +1712,8 @@ if IsInMatch() then
             return false
         end
         Playing = true
+        PlayToken = PlayToken + 1
+        local token = PlayToken
 
         local total = #macro.Actions
         local okCount, failCount, missing, pending = 0, 0, 0, 0
@@ -1600,7 +1739,14 @@ if IsInMatch() then
             for i, action in ipairs(macro.Actions) do
                 local target = action.t + lag
                 local remaining = target - (tick() - startedAt)
-                if remaining > 0 then task.wait(remaining) end
+                while remaining > 0 and token == PlayToken do
+                    task.wait(math.min(remaining, 0.2))
+                    remaining = target - (tick() - startedAt)
+                end
+                if token ~= PlayToken then
+                    Log("info", "Playback stopped")
+                    break
+                end
 
                 local remote = RemotesByLabel[action.remote]
                 local tag = string.format("#%d/%d %s", i, total, action.remote)
@@ -1610,7 +1756,11 @@ if IsInMatch() then
                 else
                     local need, source, unit = Safe(RequiredMana, action)
                     if need and need > 0 then
-                        WaitForMana(need, tag .. " [" .. source .. "]")
+                        WaitForMana(need, tag .. " [" .. source .. "]", function() return token ~= PlayToken end)
+                    end
+                    if token ~= PlayToken then
+                        Log("info", "Playback stopped")
+                        break
                     end
                     local snap = Safe(SnapshotBefore, action, unit)
 
@@ -1650,7 +1800,7 @@ if IsInMatch() then
 
             -- let in-flight calls report back before summarizing
             local deadline = tick() + 10
-            while pending > 0 and tick() < deadline do task.wait(0.1) end
+            while pending > 0 and tick() < deadline and token == PlayToken do task.wait(0.1) end
             if pending > 0 then
                 Log("warn", pending .. " call(s) never returned (server not answering?)")
             end
@@ -1665,6 +1815,13 @@ if IsInMatch() then
 
     PlayMacro = function(macro)
         task.spawn(RunMacro, macro)
+    end
+
+    StopPlayback = function()
+        if Playing then
+            PlayToken = PlayToken + 1
+            Log("info", "Stopping the playing macro")
+        end
     end
 
     LoadMacros()
@@ -2426,6 +2583,118 @@ if IsInMatch() then
         table.insert(MacroListeners, RefreshPicker)
         RefreshPicker()
         Log("info", "Editor tab built")
+    end
+
+    -- ═══ Settings tab: adjust the delays the automations use ══════════════
+    do
+        local STab  = Lib:AddTab("Settings", "full")
+        local SRoot = STab.Content
+        AddPadding(SRoot, 4)
+
+        local Box = Instance.new("Frame", SRoot)
+        Box.Size = UDim2.new(1, 0, 1, 0)
+        Box.BackgroundColor3 = Color3.fromRGB(20, 20, 23)
+        Box.BackgroundTransparency = 0.3
+        Instance.new("UICorner", Box).CornerRadius = UDim.new(0, 10)
+
+        local title = Instance.new("TextLabel", Box)
+        title.Size = UDim2.new(1, -100, 0, 22)
+        title.Position = UDim2.new(0, 10, 0, 6)
+        title.BackgroundTransparency = 1
+        title.Text = "Delays (seconds)"
+        title.TextColor3 = Color3.fromRGB(230, 230, 230)
+        title.TextSize = 13
+        title.Font = Enum.Font.GothamBold
+        title.TextXAlignment = Enum.TextXAlignment.Left
+
+        local resetBtn = Instance.new("TextButton", Box)
+        resetBtn.Size = UDim2.new(0, 76, 0, 22)
+        resetBtn.AnchorPoint = Vector2.new(1, 0)
+        resetBtn.Position = UDim2.new(1, -8, 0, 6)
+        resetBtn.BackgroundColor3 = Color3.fromRGB(55, 55, 60)
+        resetBtn.Text = "Reset all"
+        resetBtn.TextColor3 = Color3.fromRGB(235, 235, 235)
+        resetBtn.TextSize = 11
+        resetBtn.Font = Enum.Font.GothamBold
+        resetBtn.AutoButtonColor = false
+        Instance.new("UICorner", resetBtn).CornerRadius = UDim.new(0, 6)
+
+        local list = Instance.new("ScrollingFrame", Box)
+        list.Size = UDim2.new(1, -12, 1, -40)
+        list.Position = UDim2.new(0, 6, 0, 34)
+        list.BackgroundTransparency = 1
+        list.BorderSizePixel = 0
+        list.ScrollBarThickness = 4
+        list.CanvasSize = UDim2.new(0, 0, 0, 0)
+        list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        list.ClipsDescendants = true
+        local layout = Instance.new("UIListLayout", list)
+        layout.Padding = UDim.new(0, 4)
+        layout.SortOrder = Enum.SortOrder.LayoutOrder
+
+        local function Fmt(v) return tostring(math.round(v * 100) / 100) end
+
+        local inputs = {}
+        for i, def in ipairs(DELAY_SETTINGS) do
+            local row = Instance.new("Frame", list)
+            row.Size = UDim2.new(1, -8, 0, 40)
+            row.LayoutOrder = i
+            row.BackgroundColor3 = Color3.fromRGB(30, 30, 34)
+            row.BackgroundTransparency = 0.3
+            Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+
+            local name = Instance.new("TextLabel", row)
+            name.Size = UDim2.new(1, -84, 0, 18)
+            name.Position = UDim2.new(0, 8, 0, 4)
+            name.BackgroundTransparency = 1
+            name.Text = def.label
+            name.TextColor3 = Color3.fromRGB(225, 225, 230)
+            name.TextSize = 11
+            name.Font = Enum.Font.GothamMedium
+            name.TextXAlignment = Enum.TextXAlignment.Left
+            name.TextTruncate = Enum.TextTruncate.AtEnd
+
+            local hint = Instance.new("TextLabel", row)
+            hint.Size = UDim2.new(1, -84, 0, 14)
+            hint.Position = UDim2.new(0, 8, 0, 22)
+            hint.BackgroundTransparency = 1
+            hint.Text = string.format("default %s   range %s - %s", Fmt(def.default), Fmt(def.min), Fmt(def.max))
+            hint.TextColor3 = Color3.fromRGB(130, 130, 138)
+            hint.TextSize = 9
+            hint.Font = Enum.Font.Gotham
+            hint.TextXAlignment = Enum.TextXAlignment.Left
+
+            local input = Instance.new("TextBox", row)
+            input.Size = UDim2.new(0, 64, 0, 26)
+            input.AnchorPoint = Vector2.new(1, 0.5)
+            input.Position = UDim2.new(1, -8, 0.5, 0)
+            input.BackgroundColor3 = Color3.fromRGB(25, 25, 28)
+            input.TextColor3 = Color3.fromRGB(230, 230, 235)
+            input.TextSize = 12
+            input.Font = Enum.Font.GothamBold
+            input.ClearTextOnFocus = false
+            input.Text = Fmt(MatchConfig.Delays[def.key])
+            Instance.new("UICorner", input).CornerRadius = UDim.new(0, 6)
+            inputs[def.key] = input
+
+            input.FocusLost:Connect(function()
+                local n = tonumber(input.Text)
+                if n then
+                    MatchConfig.Delays[def.key] = math.clamp(n, def.min, def.max)
+                    SaveMatchConfig()
+                end
+                input.Text = Fmt(MatchConfig.Delays[def.key]) -- shows the clamped / unchanged value
+            end)
+        end
+
+        resetBtn.Activated:Connect(function()
+            for _, def in ipairs(DELAY_SETTINGS) do
+                MatchConfig.Delays[def.key] = def.default
+                inputs[def.key].Text = Fmt(def.default)
+            end
+            SaveMatchConfig()
+            Log("info", "Settings: delays reset to defaults")
+        end)
     end
 
     -- Resume any toggles that were saved as on, now that everything above is set up
