@@ -298,6 +298,306 @@ if IsInLobby() then
         if ok then
             UpdateStatus()
         else
+            Log("er the 1--[[
+    Terraria TD Remastered
+    Lobby Auto Queue + Match (macro recorder shell) — built on DARK Lib
+    (RedZenXYZ/DARK-LIBRARY)
+]]
+
+-- ── Wait for the game to fully load, then give it a beat to settle ─────
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+task.wait(1)
+
+local Players            = game:GetService("Players")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local MarketplaceService = game:GetService("MarketplaceService")
+local TweenService       = game:GetService("TweenService")
+local RunService         = game:GetService("RunService")
+local Workspace          = game:GetService("Workspace")
+local LocalPlayer        = Players.LocalPlayer
+
+local TWEEN_MEDIUM = TweenInfo.new(0.20, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+-- ── Place detection ──────────────────────────────────────────────────
+local LOBBY_PLACE_ID = 119757349390174
+
+local function IsInLobby()
+    return game.PlaceId == LOBBY_PLACE_ID
+end
+
+local function GetPlaceName()
+    return MarketplaceService:GetProductInfo(game.PlaceId).Name
+end
+
+local PlaceNameOk, CurrentPlaceName = pcall(GetPlaceName)
+if not PlaceNameOk then
+    warn("[TDR] GetProductInfo failed, treating place name as unknown: " .. tostring(CurrentPlaceName))
+    CurrentPlaceName = nil
+end
+
+local function IsInMatch()
+    return CurrentPlaceName == "Match"
+end
+
+print(string.format(
+    "[TDR] PlaceId=%s  PlaceName=%s  InLobby=%s  InMatch=%s",
+    tostring(game.PlaceId), tostring(CurrentPlaceName), tostring(IsInLobby()), tostring(IsInMatch())
+))
+if not IsInLobby() and not IsInMatch() then
+    warn("[TDR] Neither Lobby nor Match detected for this place — no tabs will be built.")
+end
+
+-- ── DARK Lib ─────────────────────────────────────────────────────────
+local Dark
+do
+    local ok, result = pcall(function()
+        return loadstring(game:HttpGet("https://raw.githubusercontent.com/RedZenXYZ/DARK-LIBRARY/main/source.lua"))()
+    end)
+    if not ok or not result then
+        warn("[TDR] Failed to load DARK Lib: " .. tostring(result))
+        return
+    end
+    Dark = result
+end
+print("[TDR] DARK Lib loaded.")
+
+local Lib = Dark.CreateLib()
+print("[TDR] Lib window created.")
+
+-- ── Logger: prints to the executor console ──────────────────────────────
+local LogGameRemotes = false     -- set true to also print every remote the game/player fires
+
+local function Log(level, text)
+    print(string.format("[TDR][%s] %s", level, text))
+end
+
+-- Same as GetFullName() but built from .Parent only, so it's safe inside a __namecall hook
+local function PathOf(inst)
+    local parts = {}
+    local cur = inst
+    while cur and cur ~= game do
+        table.insert(parts, 1, cur.Name)
+        cur = cur.Parent
+    end
+    return table.concat(parts, ".")
+end
+
+local function Describe(v)
+    local t = typeof(v)
+    if t == "CFrame" then
+        local p = v.Position
+        return string.format("CFrame(%.1f, %.1f, %.1f)", p.X, p.Y, p.Z)
+    elseif t == "Vector3" then
+        return string.format("Vector3(%.1f, %.1f, %.1f)", v.X, v.Y, v.Z)
+    elseif t == "Instance" then
+        return "Instance<" .. PathOf(v) .. ">"
+    elseif t == "string" then
+        return '"' .. v .. '"'
+    elseif t == "table" then
+        return "{table}"
+    end
+    return tostring(v)
+end
+
+local function DescribeArgs(args, n)
+    local out = {}
+    for i = 1, (n or #args) do out[i] = Describe(args[i]) end
+    return table.concat(out, ", ")
+end
+
+-- ── Little notification in the middle of the screen (one at a time) ─────────
+local NotifyGui = nil
+local NotifyToken = 0
+
+local function Notify(title, text, seconds)
+    if not NotifyGui or not NotifyGui.Parent then
+        NotifyGui = Instance.new("ScreenGui")
+        NotifyGui.Name = "TDRNotify"
+        NotifyGui.ResetOnSpawn = false
+        NotifyGui.DisplayOrder = 998
+        local ok = pcall(function() NotifyGui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+        if not ok or not NotifyGui.Parent then NotifyGui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+    end
+
+    NotifyToken = NotifyToken + 1
+    local token = NotifyToken
+    for _, child in ipairs(NotifyGui:GetChildren()) do child:Destroy() end
+
+    -- no background: just outlined text, bottom centre, 50px up
+    local frame = Instance.new("Frame", NotifyGui)
+    frame.AnchorPoint = Vector2.new(0.5, 1)
+    frame.Position = UDim2.new(0.5, 0, 1, -50)
+    frame.Size = UDim2.new(0, 200, 0, 34)
+    frame.BackgroundTransparency = 1
+
+    local top = Instance.new("TextLabel", frame)
+    top.Size = UDim2.new(1, 0, 0, 12)
+    top.BackgroundTransparency = 1
+    top.Text = title
+    top.TextColor3 = Color3.fromRGB(190, 190, 198)
+    top.TextSize = 10
+    top.Font = Enum.Font.GothamMedium
+    top.TextStrokeColor3 = Color3.new(0, 0, 0)
+    top.TextTransparency = 1
+    top.TextStrokeTransparency = 1
+
+    local main = Instance.new("TextLabel", frame)
+    main.Size = UDim2.new(1, -8, 0, 20)
+    main.Position = UDim2.new(0, 4, 0, 13)
+    main.BackgroundTransparency = 1
+    main.Text = text
+    main.TextColor3 = Color3.fromRGB(240, 240, 245)
+    main.Font = Enum.Font.GothamBold
+    main.TextScaled = true
+    main.TextStrokeColor3 = Color3.new(0, 0, 0)
+    main.TextTransparency = 1
+    main.TextStrokeTransparency = 1
+    local cap = Instance.new("UITextSizeConstraint", main)
+    cap.MaxTextSize = 15
+
+    local function fade(visible, duration)
+        local info = TweenInfo.new(duration)
+        for _, label in ipairs({top, main}) do
+            TweenService:Create(label, info, {
+                TextTransparency = visible and 0 or 1,
+                TextStrokeTransparency = visible and 0.35 or 1,
+            }):Play()
+        end
+    end
+
+    fade(true, 0.15)
+    task.delay(seconds or 2.5, function()
+        if token ~= NotifyToken or not frame.Parent then return end
+        fade(false, 0.4)
+        task.wait(0.45)
+        if frame.Parent then frame:Destroy() end
+    end)
+end
+
+-- ── Config (save/load so Auto Queue survives auto-execute reloads) ─────
+local SAVE_DIR  = "TerrariaTDRemastered"
+local SAVE_FILE = SAVE_DIR .. "/lobby_queue.json"
+
+local Config = {
+    Map       = "Forest",
+    Act       = 1,
+    Mode      = "Journey",
+    AutoQueue = false,
+}
+
+function jsonencode(Table)
+	return game:GetService("HttpService"):JSONEncode(Table)
+end
+
+function jsondecode(TableString)
+	return game:GetService("HttpService"):JSONDecode(TableString)
+end
+
+local function LoadConfig()
+    local ok, result = pcall(function()
+        if isfolder and not isfolder(SAVE_DIR) then makefolder(SAVE_DIR) end
+        if isfile and isfile(SAVE_FILE) then
+            return jsondecode(readfile(SAVE_FILE))
+        end
+    end)
+    if ok and type(result) == "table" then
+        for k, v in pairs(Config) do
+            if result[k] == nil then result[k] = v end
+        end
+        Config = result
+    end
+end
+
+function SaveConfig()
+    if isfolder and not isfolder(SAVE_DIR) then makefolder(SAVE_DIR) end
+    writefile(SAVE_FILE, jsonencode(Config))
+    print("Config has been saved.")
+end
+
+LoadConfig()
+
+-- ── Maps / Acts / Modes ─────────────────────────────────────────────────
+local MAP_ACTS   = {Forest = 6, Desert = 5}
+local MAP_NAMES  = {"Forest", "Desert"}
+local MODE_NAMES = {"Journey", "Classic", "Expert", "Master"}
+
+local function ActOptions(mapName)
+    local opts = {}
+    for i = 1, (MAP_ACTS[mapName] or 1) do
+        opts[i] = i
+    end
+    return opts
+end
+
+-- ═════════════════════════════════════════════════════════════════════
+-- UI HELPER
+-- ═════════════════════════════════════════════════════════════════════
+local function AddPadding(parent, top, bottom, left, right)
+	local UIPadding = Instance.new("UIPadding", parent)
+	UIPadding.PaddingTop = UDim.new(0, top)
+	UIPadding.PaddingBottom = UDim.new(0, bottom or top)
+	UIPadding.PaddingLeft = UDim.new(0, left or top)
+	UIPadding.PaddingRight = UDim.new(0, right or top)
+
+	return UIPadding
+end
+
+-- ═════════════════════════════════════════════════════════════════════
+-- LOBBY TAB
+-- ═════════════════════════════════════════════════════════════════════
+if IsInLobby() then
+    print("[TDR] Building Lobby tab...")
+    local Tab = Lib:AddTab("Lobby Queue")
+
+    local Status = Tab:AddTextLabel(
+        string.format("%s | %s | %s", Config.Map, Config.Act, Config.Mode),
+        12, Color3.fromRGB(160, 160, 165)
+    )
+
+    local function UpdateStatus()
+        Status:SetText(string.format("%s | %s | %s", Config.Map, Config.Act, Config.Mode))
+    end
+
+    local ActDrop -- forward-declared so the Map callback can update it
+
+    Tab:AddDropdown("Map", "Selected map", MAP_NAMES, "single", function(val)
+        Config.Map = val
+        if Config.Act > (MAP_ACTS[val] or 1) then Config.Act = 1 end
+        ActDrop:SetOptions(ActOptions(val))
+        SaveConfig()
+        UpdateStatus()
+    end)
+
+    ActDrop = Tab:AddDropdown("Act", "Selected act", ActOptions(Config.Map), "single", function(val)
+        Config.Act = val
+        SaveConfig()
+        UpdateStatus()
+    end)
+
+    Tab:AddDropdown("Mode", "Difficulty", MODE_NAMES, "single", function(val)
+        Config.Mode = val
+        SaveConfig()
+        UpdateStatus()
+    end)
+
+    -- ── Queue logic ────────────────────────────────────────────────────
+    local function DoQueue()
+        local UI = ReplicatedStorage:WaitForChild("Events"):WaitForChild("UI")
+        Log("send", string.format(">> CreateQueue(%s, %s, %s, 1, \"\")",
+            tostring(Config.Map), tostring(Config.Act), tostring(Config.Mode)))
+        local ok, err = pcall(function()
+            local r1 = UI.CreateQueue:InvokeServer(Config.Map, Config.Act, Config.Mode, 1, "")
+            Log("ok", "<< CreateQueue returned: " .. Describe(r1))
+            task.wait(0.5) -- let the queue register server-side before starting it
+            Log("send", ">> StartQueue()")
+            local r2 = UI.StartQueue:InvokeServer()
+            Log("ok", "<< StartQueue returned: " .. Describe(r2))
+        end)
+        if ok then
+            UpdateStatus()
+        else
             Log("error", "Queue failed: " .. tostring(err))
             Status:SetText("Queue failed — " .. tostring(err))
         end
@@ -342,25 +642,33 @@ if IsInMatch() then
         AutoUpgrade       = false,
         AutoFish          = false,
         FishMode          = "Cast + catch",
+        MacroMode         = "Timed",
         Delays            = {},
         CollectMode       = "TouchInterest",
         AutoPlayMacro     = false,
         SelectedMacroName = nil,
     }
-    local COLLECT_MODES = {"TouchInterest", "Teleport", "MoveTo"}
+    local COLLECT_MODES = {"TouchInterest", "Tween", "MoveTo"}
     local FISH_MODES    = {"Cast + catch", "Catch only"}
+    local MACRO_MODES   = {"Timed", "Mana"} -- Timed: recorded timeline. Mana: go as soon as there's enough mana
 
     -- Delays the automations use, in seconds; adjustable in the Settings tab
     local DELAY_SETTINGS = {
-        {key = "TeleportDwell",   label = "Teleport collect: time on each drop",   default = 0.2,  min = 0.02, max = 2},
-        {key = "TeleportReturn",  label = "Teleport collect: pause after returning", default = 0.25, min = 0,    max = 3},
-        {key = "MoveToTimeout",   label = "MoveTo collect: give up on a drop after", default = 4,    min = 1,    max = 15},
-        {key = "MoveToRevisit",   label = "MoveTo collect: skip a visited drop for", default = 5,    min = 0,    max = 30},
-        {key = "ReplayDelay",     label = "Auto-Replay: wait before replaying",     default = 3,    min = 0,    max = 15},
-        {key = "UpgradeCooldown", label = "Auto-Upgrade: retry a failed upgrade after", default = 3, min = 0,    max = 15},
-        {key = "UpgradePoll",     label = "Auto-Upgrade: check mana every",         default = 0.2,  min = 0.05, max = 2},
-        {key = "FishCatchDelay",  label = "Auto-Fish: wait before reeling in",      default = 0.15, min = 0,    max = 2},
-        {key = "FishRecastDelay", label = "Auto-Fish: wait before the next cast",   default = 1.5,  min = 0,    max = 10},
+        {key = "TeleportDwell",      label = "Tween collect: time on each drop",         default = 0.2,  min = 0.02, max = 2},
+        {key = "TeleportReturn",     label = "Tween collect: pause after returning",     default = 0.25, min = 0,    max = 3},
+        {key = "TweenSpeed",         label = "Tween collect: speed (studs per second)",  default = 120,  min = 20,   max = 400},
+        {key = "MoveToTimeout",      label = "MoveTo collect: give up on a drop after",  default = 4,    min = 1,    max = 15},
+        {key = "MoveToRevisit",      label = "MoveTo collect: skip a visited drop for",  default = 5,    min = 0,    max = 30},
+        {key = "ReplayDelay",        label = "Auto-Replay: wait before replaying",       default = 3,    min = 0,    max = 15},
+        {key = "ReplayDropWait",     label = "Auto-Replay: wait for drops to be collected", default = 8, min = 0,    max = 60},
+        {key = "ReplayTweenTimeout", label = "Auto-Replay: tween to leftover drops for", default = 10,  min = 0,    max = 60},
+        {key = "UpgradeCooldown",    label = "Auto-Upgrade: retry a failed upgrade after", default = 3,  min = 0,    max = 15},
+        {key = "UpgradePoll",        label = "Auto-Upgrade: check mana every",           default = 0.2,  min = 0.05, max = 2},
+        {key = "FishCatchDelay",     label = "Auto-Fish: wait before reeling in",        default = 0.15, min = 0,    max = 2},
+        {key = "FishRecastDelay",    label = "Auto-Fish: wait before the next cast",     default = 1.5,  min = 0,    max = 10},
+        {key = "ManaModeGap",        label = "Mana mode: minimum gap between actions",   default = 0.15, min = 0,    max = 2},
+        {key = "ActionRetries",      label = "Rejected place/upgrade: retries",           default = 5,    min = 0,    max = 20},
+        {key = "ActionRetryDelay",   label = "Rejected place/upgrade: wait before retry", default = 0.3,  min = 0.05, max = 3},
     }
 
     local function LoadMatchConfig()
@@ -387,8 +695,12 @@ if IsInMatch() then
     end
 
     LoadMatchConfig()
+    if MatchConfig.CollectMode == "Teleport" then MatchConfig.CollectMode = "Tween" end -- renamed
     if not table.find(COLLECT_MODES, MatchConfig.CollectMode) then
         MatchConfig.CollectMode = "TouchInterest"
+    end
+    if not table.find(MACRO_MODES, MatchConfig.MacroMode) then
+        MatchConfig.MacroMode = "Timed"
     end
     if not table.find(FISH_MODES, MatchConfig.FishMode) then
         MatchConfig.FishMode = "Cast + catch"
@@ -462,7 +774,7 @@ if IsInMatch() then
 
         local t0 = tick()
         Log("info", string.format("%s waiting for mana: %.0f/%.0f", tag, v.Value, cost))
-        while v.Value < cost and tick() - t0 < 60 and not (cancelled and cancelled()) do task.wait(0.1) end
+        while v.Value < cost and tick() - t0 < 60 and not (cancelled and cancelled()) do task.wait() end -- every frame
         if cancelled and cancelled() then return false end
         if v.Value >= cost then
             Log("ok", string.format("%s mana ready after %.1fs (%.0f)", tag, tick() - t0, v.Value))
@@ -492,38 +804,7 @@ if IsInMatch() then
         end)
         CostWatcher = conn
         task.delay(1.5, function()
-            if conn.Connected then conn:Disconnect() end
-            if CostWatcher == conn then CostWatcher = nil end
-        end)
-    end
-
-    -- ── Unit data: exact costs from the game's own Units module ───────────────
-    -- require(ReplicatedStorage.Modules.Content.Units)[unitName].Upgrades[n].Cost,
-    -- where Upgrades[0].Cost is the placement cost. Placed units live in
-    -- workspace.Battle.Units with attributes ID and Upgrade (current level).
-    local UnitsData, unitsWarned = nil, false
-
-    local function GetUnitsData()
-        if UnitsData then return UnitsData end
-        local ok, result = pcall(function()
-            return require(ReplicatedStorage.Modules.Content.Units)
-        end)
-        if ok and type(result) == "table" then
-            UnitsData = result
-        elseif not unitsWarned then
-            unitsWarned = true
-            Log("warn", "Units data unavailable (ReplicatedStorage.Modules.Content.Units): " .. tostring(result))
-        end
-        return UnitsData
-    end
-
-    local function GetUnitsFolder()
-        local battle = Workspace:FindFirstChild("Battle")
-        return battle and battle:FindFirstChild("Units")
-    end
-
-    local function FindUnitById(id)
-        local folder = GetUnitsFolder()
+            if conn.Connected then conn:Dilocal folder = GetUnitsFolder()
         if folder and id ~= nil then
             for _, u in ipairs(folder:GetChildren()) do
                 if tostring(u:GetAttribute("ID")) == tostring(id) then return u end
